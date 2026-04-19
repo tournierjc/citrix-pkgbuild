@@ -15,8 +15,19 @@ optdepends=(
 )
 provides=('icaclient')
 conflicts=('icaclient')
-source=("ICAClient-rhel-26.01.0.150-0.x86_64.rpm")
-noextract=("ICAClient-rhel-26.01.0.150-0.x86_64.rpm")
+
+# Dynamically discover the vendor RPM download URL from Citrix's workspace page,
+# mirroring the AUR icaclient PKGBUILD approach. This lets makepkg download the
+# RPM automatically rather than requiring a manual drop-in.
+_citrix_dl_page="https://www.citrix.com/downloads/workspace-app/linux/workspace-app-for-linux-latest.html"
+_dl_urls="$(curl -sL "$_citrix_dl_page" | grep -oP '(?<=href=")[^"]+linuxx64[^"]+\.rpm(\?[^"]*)?' | head -n1 || true)"
+
+if [[ -n "$_dl_urls" ]]; then
+  source=("ICAClient-rhel-${pkgver}-0.x86_64.rpm::https:${_dl_urls}")
+else
+  source=("ICAClient-rhel-${pkgver}-0.x86_64.rpm")
+fi
+noextract=("ICAClient-rhel-${pkgver}-0.x86_64.rpm")
 sha256sums=('SKIP')
 install=icaclient-bin.install
 options=(!strip)
@@ -24,7 +35,41 @@ options=(!strip)
 build() {
   cd "$srcdir"
   rm -rf opt usr etc
-  rpm2cpio ICAClient-rhel-26.01.0.150-0.x86_64.rpm | cpio -idmv
+  rpm2cpio "ICAClient-rhel-${pkgver}-0.x86_64.rpm" | cpio -idmv
+}
+
+package() {
+  cd "$srcdir"
+  source=("ICAClient-${pkgver}.rpm::${_source64}")
+  noextract=("ICAClient-${pkgver}.rpm")
+  sha256sums=('SKIP')
+else
+  # Fallback to the old behaviour: expect a local RPM file with the exact name.
+  source=("ICAClient-rhel-${pkgver}-0.x86_64.rpm")
+  noextract=("ICAClient-rhel-${pkgver}-0.x86_64.rpm")
+  sha256sums=('SKIP')
+fi
+
+install=icaclient-bin.install
+options=(!strip)
+
+build() {
+  cd "$srcdir"
+  rm -rf opt usr etc
+  # Support both dynamically downloaded name and legacy RPM name.
+  if [[ -f "ICAClient-${pkgver}.rpm" ]]; then
+    rpm2cpio "ICAClient-${pkgver}.rpm" | cpio -idmv
+  elif [[ -f "ICAClient-rhel-${pkgver}-0.x86_64.rpm" ]]; then
+    rpm2cpio "ICAClient-rhel-${pkgver}-0.x86_64.rpm" | cpio -idmv
+  else
+    # fallback: use first .rpm in srcdir
+    set -- *.rpm
+    if [[ -f "$1" ]]; then
+      rpm2cpio "$1" | cpio -idmv
+    else
+      echo "No RPM found to extract"; return 1
+    fi
+  fi
 }
 
 package() {
