@@ -1,75 +1,61 @@
 pkgname=icaclient-bin
-pkgver=26.01.0.150
-pkgrel=9
+pkgver=26.04.10.1
+pkgrel=1
 pkgdesc="Citrix ICA Client (repackaged vendor RPM, no compilation)"
 arch=('x86_64')
-url="https://www.citrix.com"
+url="https://www.citrix.com/downloads/workspace-app/linux/workspace-app-for-linux-latest.html"
 license=('custom:Citrix')
 depends=(
   bash bubblewrap
   libxss libxrandr libxcursor libxcomposite libxdamage libxfixes libxinerama libxtst
   alsa-lib libx11 libxcb nss gtk3 libsoup webkit2gtk-4.1
 )
+makedepends=(rpm-tools cpio)
 optdepends=(
   'lshw: hardware probing some Citrix diagnostics may attempt to use'
 )
 provides=('icaclient')
 conflicts=('icaclient')
 
-# Dynamically discover the vendor RPM download URL from Citrix's workspace page,
-# mirroring the AUR icaclient PKGBUILD approach. This lets makepkg download the
-# RPM automatically rather than requiring a manual drop-in.
-_citrix_dl_page="https://www.citrix.com/downloads/workspace-app/linux/workspace-app-for-linux-latest.html"
-_dl_urls="$(curl -sL "$_citrix_dl_page" | grep -oP '(?<=href=")[^"]+linuxx64[^"]+\.rpm(\?[^"]*)?' | head -n1 || true)"
-
-if [[ -n "$_dl_urls" ]]; then
-  source=("ICAClient-rhel-${pkgver}-0.x86_64.rpm::https:${_dl_urls}")
-else
-  source=("ICAClient-rhel-${pkgver}-0.x86_64.rpm")
+# Citrix puts the time-limited download token on rel=, not href=. Since 2604
+# the RHEL RPM is named ICAClient-rhel-gcc-8-${pkgver}-0.x86_64.rpm.
+_citrix_dl_page="$url"
+_rpm_file="ICAClient-rhel-gcc-8-${pkgver}-0.x86_64.rpm"
+_html="$(curl -fsSL "$_citrix_dl_page" 2>/dev/null || true)"
+_dl_rel="$(printf '%s\n' "$_html" \
+  | grep -oP '(?<=rel=")[^"]*ICAClient-rhel-gcc-8-'"${pkgver}"'[^"]*\.rpm(\?[^"]*)?' \
+  | head -n1 || true)"
+if [[ -z "$_dl_rel" ]]; then
+  _rpm_file="ICAClient-rhel-${pkgver}-0.x86_64.rpm"
+  _dl_rel="$(printf '%s\n' "$_html" \
+    | grep -oP '(?<=rel=")[^"]*ICAClient-rhel-'"${pkgver}"'[^"]*\.rpm(\?[^"]*)?' \
+    | head -n1 || true)"
 fi
-noextract=("ICAClient-rhel-${pkgver}-0.x86_64.rpm")
-sha256sums=('SKIP')
+
+if [[ -n "$_dl_rel" ]]; then
+  source=("${_rpm_file}::https:${_dl_rel}")
+else
+  source=("${_rpm_file}")
+fi
+noextract=("${_rpm_file}")
+sha256sums=('c29820638ef5924233dd7546058e0ff662aae5c2a2e280c8eb900246908d9f25')
 install=icaclient-bin.install
 options=(!strip)
 
 build() {
   cd "$srcdir"
   rm -rf opt usr etc
-  rpm2cpio "ICAClient-rhel-${pkgver}-0.x86_64.rpm" | cpio -idmv
-}
-
-package() {
-  cd "$srcdir"
-  source=("ICAClient-${pkgver}.rpm::${_source64}")
-  noextract=("ICAClient-${pkgver}.rpm")
-  sha256sums=('SKIP')
-else
-  # Fallback to the old behaviour: expect a local RPM file with the exact name.
-  source=("ICAClient-rhel-${pkgver}-0.x86_64.rpm")
-  noextract=("ICAClient-rhel-${pkgver}-0.x86_64.rpm")
-  sha256sums=('SKIP')
-fi
-
-install=icaclient-bin.install
-options=(!strip)
-
-build() {
-  cd "$srcdir"
-  rm -rf opt usr etc
-  # Support both dynamically downloaded name and legacy RPM name.
-  if [[ -f "ICAClient-${pkgver}.rpm" ]]; then
-    rpm2cpio "ICAClient-${pkgver}.rpm" | cpio -idmv
+  local rpm
+  if [[ -f "ICAClient-rhel-gcc-8-${pkgver}-0.x86_64.rpm" ]]; then
+    rpm="ICAClient-rhel-gcc-8-${pkgver}-0.x86_64.rpm"
   elif [[ -f "ICAClient-rhel-${pkgver}-0.x86_64.rpm" ]]; then
-    rpm2cpio "ICAClient-rhel-${pkgver}-0.x86_64.rpm" | cpio -idmv
+    rpm="ICAClient-rhel-${pkgver}-0.x86_64.rpm"
   else
-    # fallback: use first .rpm in srcdir
     set -- *.rpm
-    if [[ -f "$1" ]]; then
-      rpm2cpio "$1" | cpio -idmv
-    else
-      echo "No RPM found to extract"; return 1
-    fi
+    [[ -f "$1" ]] || { echo "No RPM found to extract"; return 1; }
+    rpm="$1"
   fi
+  rpm2cpio "$rpm" | cpio -idmv
 }
 
 package() {
@@ -120,23 +106,33 @@ KeyboardLayout = French
 KeyboardType=(Default)
 KeyboardMappingFile = automatic.kbd
 KeyboardDescription = French
-KeyboardEventMode = Automatic
-KeyboardSyncMode = Off
+KeyboardEventMode = Scancode
+KeyboardSyncMode = No
+MouseSendsControlV=False
 ClientAudio=On
 AllowLocalDrives=True
 DisablePrinterRedirection=False
 EOF
   fi
 
+  # Nested RDP (MSTSC inside a Windows VDA) needs scancodes for Ctrl+C/V.
+  # Citrix recommends KeyboardEventMode=Scancode when KeyboardSyncMode=No.
+  # Automatic maps Windows VDAs to Unicode, which drops modifier chords.
+  # MouseSendsControlV=True (vendor default) remaps middle-click to Ctrl+V,
+  # which breaks "open in new tab" and other MB2 actions in Windows apps.
   if [[ -f "$root/config/wfclient.ini" ]]; then
     sed -i \
       -e 's/^KeyboardLayout *=.*/KeyboardLayout = French/' \
       -e 's/^KeyboardType *=.*/KeyboardType=(Default)/' \
       -e 's/^KeyboardMappingFile *=.*/KeyboardMappingFile = automatic.kbd/' \
       -e 's/^KeyboardDescription *=.*/KeyboardDescription = French/' \
-      -e 's/^KeyboardEventMode *=.*/KeyboardEventMode = Automatic/' \
-      -e 's/^KeyboardSyncMode *=.*/KeyboardSyncMode = Off/' \
+      -e 's/^KeyboardEventMode *=.*/KeyboardEventMode = Scancode/' \
+      -e 's/^KeyboardSyncMode *=.*/KeyboardSyncMode = No/' \
+      -e 's/^MouseSendsControlV *=.*/MouseSendsControlV=False/' \
       "$root/config/wfclient.ini"
+    if ! grep -q '^MouseSendsControlV *=' "$root/config/wfclient.ini"; then
+      sed -i '/^\[WFClient\]/a MouseSendsControlV=False' "$root/config/wfclient.ini"
+    fi
   fi
 
   # Force the same keyboard defaults in appsrv.ini as well; some Citrix flows
