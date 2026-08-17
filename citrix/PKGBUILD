@@ -1,12 +1,12 @@
 pkgname=icaclient-bin
 pkgver=26.04.10.1
-pkgrel=1
+pkgrel=2
 pkgdesc="Citrix ICA Client (repackaged vendor RPM, no compilation)"
 arch=('x86_64')
 url="https://www.citrix.com/downloads/workspace-app/linux/workspace-app-for-linux-latest.html"
 license=('custom:Citrix')
 depends=(
-  bash bubblewrap
+  bash bubblewrap xclip wl-clipboard imagemagick
   libxss libxrandr libxcursor libxcomposite libxdamage libxfixes libxinerama libxtst
   alsa-lib libx11 libxcb nss gtk3 libsoup webkit2gtk-4.1
 )
@@ -33,12 +33,12 @@ if [[ -z "$_dl_rel" ]]; then
 fi
 
 if [[ -n "$_dl_rel" ]]; then
-  source=("${_rpm_file}::https:${_dl_rel}")
+  source=("${_rpm_file}::https:${_dl_rel}" "citrix-clip-bridge")
 else
-  source=("${_rpm_file}")
+  source=("${_rpm_file}" "citrix-clip-bridge")
 fi
 noextract=("${_rpm_file}")
-sha256sums=('c29820638ef5924233dd7546058e0ff662aae5c2a2e280c8eb900246908d9f25')
+sha256sums=('c29820638ef5924233dd7546058e0ff662aae5c2a2e280c8eb900246908d9f25' 'SKIP')
 install=icaclient-bin.install
 options=(!strip)
 
@@ -107,7 +107,10 @@ KeyboardType=(Default)
 KeyboardMappingFile = automatic.kbd
 KeyboardDescription = French
 KeyboardEventMode = Scancode
-KeyboardSyncMode = No
+KeyboardSyncMode = Once
+UseEUKS=2
+UseEUKSforASCII=True
+KeyboardSendLocale=True
 MouseSendsControlV=False
 ClientAudio=On
 AllowLocalDrives=True
@@ -116,10 +119,10 @@ EOF
   fi
 
   # Nested RDP (MSTSC inside a Windows VDA) needs scancodes for Ctrl+C/V.
-  # Citrix recommends KeyboardEventMode=Scancode when KeyboardSyncMode=No.
-  # Automatic maps Windows VDAs to Unicode, which drops modifier chords.
-  # MouseSendsControlV=True (vendor default) remaps middle-click to Ctrl+V,
-  # which breaks "open in new tab" and other MB2 actions in Windows apps.
+  # Sync French once at launch so the VDA layout matches AZERTY scancodes.
+  # UseEUKSforASCII sends character keys as Unicode so MSTSC/Winlogon (often
+  # US QWERTY until the user profile loads) still receives AZERTY letters.
+  # MouseSendsControlV=True (vendor default) remaps middle-click to Ctrl+V.
   if [[ -f "$root/config/wfclient.ini" ]]; then
     sed -i \
       -e 's/^KeyboardLayout *=.*/KeyboardLayout = French/' \
@@ -127,12 +130,20 @@ EOF
       -e 's/^KeyboardMappingFile *=.*/KeyboardMappingFile = automatic.kbd/' \
       -e 's/^KeyboardDescription *=.*/KeyboardDescription = French/' \
       -e 's/^KeyboardEventMode *=.*/KeyboardEventMode = Scancode/' \
-      -e 's/^KeyboardSyncMode *=.*/KeyboardSyncMode = No/' \
+      -e 's/^KeyboardSyncMode *=.*/KeyboardSyncMode = Once/' \
+      -e 's/^UseEUKS *=.*/UseEUKS=2/' \
+      -e 's/^UseEUKSforASCII *=.*/UseEUKSforASCII=True/' \
+      -e 's/^KeyboardSendLocale *=.*/KeyboardSendLocale=True/' \
       -e 's/^MouseSendsControlV *=.*/MouseSendsControlV=False/' \
       "$root/config/wfclient.ini"
-    if ! grep -q '^MouseSendsControlV *=' "$root/config/wfclient.ini"; then
+    grep -q '^UseEUKS *=' "$root/config/wfclient.ini" || \
+      sed -i '/^\[WFClient\]/a UseEUKS=2' "$root/config/wfclient.ini"
+    grep -q '^UseEUKSforASCII *=' "$root/config/wfclient.ini" || \
+      sed -i '/^\[WFClient\]/a UseEUKSforASCII=True' "$root/config/wfclient.ini"
+    grep -q '^KeyboardSendLocale *=' "$root/config/wfclient.ini" || \
+      sed -i '/^\[WFClient\]/a KeyboardSendLocale=True' "$root/config/wfclient.ini"
+    grep -q '^MouseSendsControlV *=' "$root/config/wfclient.ini" || \
       sed -i '/^\[WFClient\]/a MouseSendsControlV=False' "$root/config/wfclient.ini"
-    fi
   fi
 
   # Force the same keyboard defaults in appsrv.ini as well; some Citrix flows
@@ -186,6 +197,9 @@ EOF
   done
   find "$root" \( -name '*.so' -o -name '*.so.*' \) -type f -exec chmod 755 {} +
   [[ -d "$root/Webkit2gtk4.0/lib" ]] && find "$root/Webkit2gtk4.0/lib" -type f -exec chmod 755 {} +
+  [[ -d "$root/util" ]] && find "$root/util" -type f -exec chmod 755 {} +
+
+  install -Dm755 "$srcdir/citrix-clip-bridge" "$root/util/citrix-clip-bridge"
 
   install -d "$pkgdir/usr/bin"
 
@@ -200,15 +214,31 @@ export GTK_PATH="${ICAROOT}/gtk${GTK_PATH:+:${GTK_PATH}}"
 CLIENTFILE="${ICAROOT}/config/wfclient.ini"
 PROTOCOLFILE="${ICAROOT}/config/module.ini"
 
+bpid=
+if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -x "$ICAROOT/util/citrix-clip-bridge" ]; then
+  "$ICAROOT/util/citrix-clip-bridge" &
+  bpid=$!
+  trap 'kill "$bpid" 2>/dev/null' EXIT INT TERM
+fi
+
+filearg=
 if [ "$#" -eq 1 ] && [ -f "$1" ]; then
   case "$1" in
-    *.ica|*.ICA)
-      exec "$ICAROOT/wfica" -icaroot "$ICAROOT" -protocolfile "$PROTOCOLFILE" -clientfile "$CLIENTFILE" -file "$(readlink -f "$1")"
-      ;;
+    *.ica|*.ICA) filearg=$(readlink -f "$1") ;;
   esac
 fi
 
-exec "$ICAROOT/wfica" -icaroot "$ICAROOT" -protocolfile "$PROTOCOLFILE" -clientfile "$CLIENTFILE" "$@"
+if [ -n "$filearg" ]; then
+  set -- -icaroot "$ICAROOT" -protocolfile "$PROTOCOLFILE" -clientfile "$CLIENTFILE" -file "$filearg"
+else
+  set -- -icaroot "$ICAROOT" -protocolfile "$PROTOCOLFILE" -clientfile "$CLIENTFILE" "$@"
+fi
+
+if [ -n "$bpid" ]; then
+  "$ICAROOT/wfica" "$@"
+else
+  exec "$ICAROOT/wfica" "$@"
+fi
 EOF
   chmod 755 "$pkgdir/usr/bin/wfica"
 
