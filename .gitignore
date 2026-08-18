@@ -3,3 +3,5 @@ pkg/
 *.pkg.tar.*
 *.rpm
 *.log
+__pycache__/
+*.pyc

@@ -1,6 +1,6 @@
 pkgname=icaclient-bin
 pkgver=26.04.10.1
-pkgrel=6
+pkgrel=13
 pkgdesc="Citrix ICA Client (repackaged vendor RPM, no compilation)"
 arch=('x86_64')
 url="https://www.citrix.com/downloads/workspace-app/linux/workspace-app-for-linux-latest.html"
@@ -33,12 +33,12 @@ if [[ -z "$_dl_rel" ]]; then
 fi
 
 if [[ -n "$_dl_rel" ]]; then
-  source=("${_rpm_file}::https:${_dl_rel}" "citrix-clip-bridge")
+  source=("${_rpm_file}::https:${_dl_rel}" "citrix-clip-bridge" "citrix-clip-bridge.service")
 else
-  source=("${_rpm_file}" "citrix-clip-bridge")
+  source=("${_rpm_file}" "citrix-clip-bridge" "citrix-clip-bridge.service")
 fi
 noextract=("${_rpm_file}")
-sha256sums=('c29820638ef5924233dd7546058e0ff662aae5c2a2e280c8eb900246908d9f25' 'SKIP')
+sha256sums=('c29820638ef5924233dd7546058e0ff662aae5c2a2e280c8eb900246908d9f25' 'SKIP' 'SKIP')
 install=icaclient-bin.install
 options=(!strip)
 
@@ -200,6 +200,11 @@ EOF
   [[ -d "$root/util" ]] && find "$root/util" -type f -exec chmod 755 {} +
 
   install -Dm755 "$srcdir/citrix-clip-bridge" "$root/util/citrix-clip-bridge"
+  install -Dm644 "$srcdir/citrix-clip-bridge.service" \
+    "$pkgdir/usr/lib/systemd/user/citrix-clip-bridge.service"
+  install -d "$pkgdir/usr/lib/systemd/user/graphical-session.target.wants"
+  ln -s ../citrix-clip-bridge.service \
+    "$pkgdir/usr/lib/systemd/user/graphical-session.target.wants/citrix-clip-bridge.service"
 
   install -d "$pkgdir/usr/bin"
 
@@ -214,14 +219,17 @@ export GTK_PATH="${ICAROOT}/gtk${GTK_PATH:+:${GTK_PATH}}"
 CLIENTFILE="${ICAROOT}/config/wfclient.ini"
 PROTOCOLFILE="${ICAROOT}/config/module.ini"
 
-# Isolate the clip bridge from Citrix LD_LIBRARY_PATH/GTK_PATH so system Gtk works.
+# Clip bridge is a user systemd service. Keep a fallback start if it is not
+# running yet; do not kill a systemd-managed instance on every wfica launch.
 if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -x "$ICAROOT/util/citrix-clip-bridge" ]; then
-    setsid env -u GTK_PATH -u GTK_EXE_PREFIX -u GTK_DATA_PREFIX -u LD_LIBRARY_PATH \
-      GDK_BACKEND=x11 DISPLAY="${DISPLAY:-:0}" \
-      WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
-      XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
-      HOME="${HOME:-}" PATH="/usr/bin:/bin" \
-      "$ICAROOT/util/citrix-clip-bridge" >/dev/null 2>&1 &
+    if ! systemctl --user is-active --quiet citrix-clip-bridge.service 2>/dev/null; then
+        setsid env -u GTK_PATH -u GTK_EXE_PREFIX -u GTK_DATA_PREFIX -u LD_LIBRARY_PATH \
+          GDK_BACKEND=x11 DISPLAY="${DISPLAY:-:0}" \
+          WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+          XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+          HOME="${HOME:-}" PATH="/usr/bin:/bin" \
+          "$ICAROOT/util/citrix-clip-bridge" >/dev/null 2>&1 &
+    fi
 fi
 
 filearg=

@@ -1,16 +1,21 @@
 #!/usr/bin/python3
-"""Offer Wayland image/png captures to X11 as CF_DIB/PIXMAP for Citrix wfica.
+"""Offer Wayland image/png captures to X11 as CF_DIB for Citrix wfica.
 
 wfica only imports a short X11 target list (DIB, _ISL_DIB, PIXMAP, text).
 KDE copies screenshots as Wayland image/png; XWayland re-offers MIME types,
 which Citrix logs as "No interesting targets".
 
-This process daemonizes (ignores SIGHUP), owns CLIPBOARD/PRIMARY with Gtk,
-and answers TARGETS, TIMESTAMP, DIB, _ISL_DIB, and PIXMAP. Ingest is a FIFO
-notify, not SIGUSR1: Python's default SIGUSR1 handler would kill the daemon.
+GTK sends large DIB via INCR because XMaxRequestSize is ~256KB. wfica
+reassembles those chunks incorrectly (image split). This daemon serves DIB
+with XChangeProperty on a BIG-REQUESTS connection (~16MB) so the bitmap
+goes in one reply. 32bpp BI_RGB avoids the 24bpp row-pad channel swap.
+
+Citrix's _ISL_DIB importer always memcpy's pixels from offset 0x428
+(BITMAPINFOHEADER + a 1024-byte RGBQUAD slot), not from offset 40.
 """
 from __future__ import annotations
 
+import ctypes
 import fcntl
 import hashlib
 import os
@@ -48,12 +53,73 @@ PID_PATH = os.path.join(RUNDIR, "citrix-clip-bridge.pid")
 PNG_PATH = os.path.join(RUNDIR, "citrix-clip-bridge.png")
 NOTIFY_PATH = os.path.join(RUNDIR, "citrix-clip-bridge.notify")
 
+PropModeReplace = 0
+# construct_dib / import_dib_from_X_server: pixels live at header + 1024.
+ISL_PIXELS = 0x428
+ISL_RGBQUAD = 0x400
+
+libX11 = ctypes.CDLL("libX11.so.6")
+libX11.XOpenDisplay.restype = ctypes.c_void_p
+libX11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+libX11.XInternAtom.restype = ctypes.c_ulong
+libX11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+libX11.XChangeProperty.restype = ctypes.c_int
+libX11.XChangeProperty.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_ulong,
+    ctypes.c_ulong,
+    ctypes.c_ulong,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_void_p,
+    ctypes.c_int,
+]
+libX11.XFlush.argtypes = [ctypes.c_void_p]
+libX11.XExtendedMaxRequestSize.restype = ctypes.c_long
+libX11.XExtendedMaxRequestSize.argtypes = [ctypes.c_void_p]
+libX11.XGetSelectionOwner.restype = ctypes.c_ulong
+libX11.XGetSelectionOwner.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+libX11.XQueryTree.restype = ctypes.c_int
+libX11.XQueryTree.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_ulong,
+    ctypes.POINTER(ctypes.c_ulong),
+    ctypes.POINTER(ctypes.c_ulong),
+    ctypes.POINTER(ctypes.c_void_p),
+    ctypes.POINTER(ctypes.c_uint),
+]
+libX11.XFree.argtypes = [ctypes.c_void_p]
+
+
+class _XClassHint(ctypes.Structure):
+    _fields_ = [("res_name", ctypes.c_void_p), ("res_class", ctypes.c_void_p)]
+
+
+libX11.XGetClassHint.restype = ctypes.c_int
+libX11.XGetClassHint.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_ulong,
+    ctypes.POINTER(_XClassHint),
+]
+
+XA_PRIMARY = 1
+
 dib_bytes = b""
 pixbuf = None
 last_hash = ""
 reassert_left = 0
 logged_gets = set()
 holder = None
+x11_dpy = None
+import_pending = False
+pulled_owner_xid = 0
+wfica_pull_tries = 0
+atom_dib = None
+atom_isl = None
+atom_bmp = None
+atom_pix = None
+atom_rgbquad = None
+xa_clipboard = 0
 
 
 def log(msg: str) -> None:
@@ -79,13 +145,24 @@ def daemonize() -> None:
         os.close(fd)
 
 
-def _manual_dib(pb) -> bytes:
+def pixbuf_to_dib(pb) -> bytes:
+    """32bpp BI_RGB in Citrix _ISL_DIB layout (pixels at 0x428)."""
+    from gi.repository import GdkPixbuf
+
+    if pb.get_has_alpha() or pb.get_n_channels() != 3:
+        w, h = pb.get_width(), pb.get_height()
+        bg = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, w, h)
+        bg.fill(0xFFFFFFFF)
+        pb.composite(
+            bg, 0, 0, w, h, 0, 0, 1.0, 1.0, GdkPixbuf.InterpType.NEAREST, 255
+        )
+        pb = bg
     w, h = pb.get_width(), pb.get_height()
     nch = pb.get_n_channels()
     rs = pb.get_rowstride()
     pixels = bytes(pb.get_pixels())
-    stride = (w * 3 + 3) & ~3
-    out = bytearray(40 + stride * h)
+    stride = w * 4
+    out = bytearray(ISL_PIXELS + stride * h)
     struct.pack_into(
         "<IiiHHIIiiII",
         out,
@@ -94,7 +171,7 @@ def _manual_dib(pb) -> bytes:
         w,
         h,
         1,
-        24,
+        32,
         0,
         stride * h,
         0,
@@ -104,58 +181,157 @@ def _manual_dib(pb) -> bytes:
     )
     for y in range(h):
         src = (h - 1 - y) * rs
-        dst = 40 + y * stride
-        for x in range(w):
-            i = src + x * nch
-            o = dst + x * 3
-            out[o] = pixels[i + 2]
-            out[o + 1] = pixels[i + 1]
-            out[o + 2] = pixels[i]
+        dst = ISL_PIXELS + y * stride
+        sx = src
+        dx = dst
+        for _x in range(w):
+            out[dx] = pixels[sx + 2]
+            out[dx + 1] = pixels[sx + 1]
+            out[dx + 2] = pixels[sx]
+            sx += nch
+            dx += 4
     return bytes(out)
 
 
-def pixbuf_to_dib(pb) -> bytes:
-    """Classic CF_DIB: BITMAPINFOHEADER (biSize=40), 24bpp BI_RGB, bottom-up BGR."""
+def as_cf_dib(isl: bytes) -> bytes:
+    if len(isl) < ISL_PIXELS:
+        return isl
+    return isl[:40] + isl[ISL_PIXELS:]
+
+
+def isl_dib_to_pixbuf(data: bytes):
     from gi.repository import GdkPixbuf
 
-    if pb.get_has_alpha():
-        w, h = pb.get_width(), pb.get_height()
-        bg = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, w, h)
-        bg.fill(0xFFFFFFFF)
-        pb.composite(
-            bg, 0, 0, w, h, 0, 0, 1.0, 1.0, GdkPixbuf.InterpType.NEAREST, 255
-        )
-        pb = bg
-    try:
-        ok, buf = pb.save_to_bufferv("bmp", [], [])
-        data = bytes(buf) if buf is not None else b""
-        if ok and data[:2] == b"BM" and len(data) >= 54:
-            off = struct.unpack_from("<I", data, 10)[0]
-            if 14 <= off <= len(data) - 40:
-                dib = data[off:]
-                bi_size, _w, _h, _planes, bpp = struct.unpack_from("<IiiHH", dib, 0)
-                if bi_size == 40 and bpp == 24:
-                    return dib
-    except Exception:
-        pass
-    return _manual_dib(pb)
+    if len(data) < 40:
+        return None
+    bi_size, w, h, _planes, bpp, comp, _sizeimg, _x, _y, clrused, _cimp = (
+        struct.unpack_from("<IiiHHIIiiII", data, 0)
+    )
+    if bi_size < 40 or w <= 0 or h == 0 or bpp not in (24, 32):
+        return None
+    h_abs = abs(h)
+    stride = ((w * bpp + 31) // 32) * 4
+    pix_off = ISL_PIXELS
+    if len(data) < pix_off + stride * h_abs:
+        pix_off = bi_size + (clrused * 4 if clrused else 0)
+        if comp == 3:
+            pix_off += 12
+    if pix_off + stride * h_abs > len(data) or stride <= 0:
+        return None
+    pb = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, w, h_abs)
+    dest = bytearray(pb.get_pixels())
+    drs = pb.get_rowstride()
+    top_down = h < 0
+    src_bpp = bpp // 8
+    for y in range(h_abs):
+        src_y = y if top_down else (h_abs - 1 - y)
+        sbase = pix_off + src_y * stride
+        dbase = y * drs
+        sx = sbase
+        dx = dbase
+        for _x in range(w):
+            dest[dx] = data[sx + 2]
+            dest[dx + 1] = data[sx + 1]
+            dest[dx + 2] = data[sx]
+            sx += src_bpp
+            dx += 3
+    packed = GdkPixbuf.Pixbuf.new_from_data(
+        bytes(dest),
+        GdkPixbuf.Colorspace.RGB,
+        False,
+        8,
+        w,
+        h_abs,
+        drs,
+    )
+    return packed.copy()
 
 
 def wfica_wm_class(text: str) -> bool:
     return "Wfica" in text or "wfica" in text
 
 
-def xprop_class(xid: str) -> str:
-    try:
-        r = subprocess.run(
-            ["xprop", "-id", xid, "WM_CLASS"],
-            capture_output=True,
-            text=True,
-            timeout=0.4,
-        )
-        return r.stdout or ""
-    except Exception:
+def x_atom(name: str) -> int:
+    if x11_dpy is None:
+        return 0
+    if name == "PRIMARY":
+        return XA_PRIMARY
+    return int(libX11.XInternAtom(x11_dpy, name.encode(), 0))
+
+
+def selection_owner_xid(name: str) -> int:
+    if x11_dpy is None:
+        return 0
+    return int(libX11.XGetSelectionOwner(x11_dpy, x_atom(name)))
+
+
+def x_parent(xid: int) -> int:
+    if x11_dpy is None or xid == 0:
+        return 0
+    root = ctypes.c_ulong()
+    parent = ctypes.c_ulong()
+    children = ctypes.c_void_p()
+    nch = ctypes.c_uint()
+    if not libX11.XQueryTree(
+        x11_dpy,
+        xid,
+        ctypes.byref(root),
+        ctypes.byref(parent),
+        ctypes.byref(children),
+        ctypes.byref(nch),
+    ):
+        return 0
+    if children:
+        libX11.XFree(children)
+    return int(parent.value)
+
+
+def x_class_text(xid: int) -> str:
+    if x11_dpy is None or xid == 0:
         return ""
+    hint = _XClassHint()
+    if not libX11.XGetClassHint(x11_dpy, xid, ctypes.byref(hint)):
+        return ""
+    parts = []
+    for ptr in (hint.res_name, hint.res_class):
+        if not ptr:
+            continue
+        raw = ctypes.cast(ptr, ctypes.c_char_p).value
+        if raw:
+            parts.append(raw.decode("utf-8", "replace"))
+        libX11.XFree(ptr)
+    return " ".join(parts)
+
+
+def window_is_wfica(xid: int) -> bool:
+    """wfica's CLIPBOARD owner is an unmapped child without WM_CLASS."""
+    cur = xid
+    seen = set()
+    for _ in range(10):
+        if cur == 0 or cur in seen:
+            return False
+        seen.add(cur)
+        if wfica_wm_class(x_class_text(cur)):
+            return True
+        parent = x_parent(cur)
+        if parent == cur:
+            return False
+        cur = parent
+    return False
+
+
+def holder_xid() -> int:
+    from gi.repository import GdkX11
+
+    if holder is None:
+        return 0
+    win = holder.get_window()
+    if win is None:
+        return 0
+    try:
+        return int(GdkX11.X11Window.get_xid(win))
+    except Exception:
+        return 0
 
 
 def wfica_is_focused() -> bool:
@@ -174,32 +350,28 @@ def wfica_is_focused() -> bool:
             xid = part
     if not xid:
         return False
-    return wfica_wm_class(xprop_class(xid))
+    try:
+        return window_is_wfica(int(xid, 16))
+    except ValueError:
+        return False
 
 
 def owner_is_wfica(selection) -> bool:
-    from gi.repository import Gdk, GdkX11
-
-    try:
-        owner = Gdk.selection_owner_get(selection)
-        if owner is None:
-            return False
-        xid = hex(GdkX11.X11Window.get_xid(owner))
-    except Exception:
+    name = _atom_name(selection) if selection is not None else "CLIPBOARD"
+    if name not in ("CLIPBOARD", "PRIMARY"):
+        name = "CLIPBOARD"
+    xid = selection_owner_xid(name)
+    if xid == 0 or xid == holder_xid():
         return False
-    return wfica_wm_class(xprop_class(xid))
+    return window_is_wfica(xid)
 
 
 def we_own(selection) -> bool:
-    from gi.repository import Gdk
-
-    if holder is None:
-        return False
-    try:
-        owner = Gdk.selection_owner_get(selection)
-        return owner is not None and owner == holder.get_window()
-    except Exception:
-        return False
+    name = _atom_name(selection) if selection is not None else "CLIPBOARD"
+    if name not in ("CLIPBOARD", "PRIMARY"):
+        name = "CLIPBOARD"
+    hid = holder_xid()
+    return hid != 0 and selection_owner_xid(name) == hid
 
 
 def x11_now() -> int:
@@ -221,6 +393,10 @@ def offer_selections(both: bool = True) -> None:
 
     if holder is None or not dib_bytes:
         return
+    if owner_is_wfica(Gdk.SELECTION_CLIPBOARD) and not we_own(
+        Gdk.SELECTION_CLIPBOARD
+    ):
+        return
     t = x11_now() or Gdk.CURRENT_TIME
     Gtk.selection_owner_set(holder, Gdk.SELECTION_PRIMARY, t)
     if both:
@@ -228,6 +404,29 @@ def offer_selections(both: bool = True) -> None:
             if owner_is_wfica(Gdk.SELECTION_CLIPBOARD):
                 return
         Gtk.selection_owner_set(holder, Gdk.SELECTION_CLIPBOARD, t)
+
+
+def pixbuf_to_png(pb) -> bytes:
+    ok, buf = pb.save_to_bufferv("png", [], [])
+    if not ok or not buf:
+        return b""
+    return bytes(buf)
+
+
+def wl_copy_png(png: bytes) -> None:
+    if not png:
+        return
+    try:
+        subprocess.run(
+            ["wl-copy", "--type", "image/png"],
+            input=png,
+            check=False,
+            timeout=8,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as exc:
+        log(f"wl-copy failed: {exc}")
 
 
 def ingest_png() -> None:
@@ -239,9 +438,7 @@ def ingest_png() -> None:
     if not png:
         return
     digest = hashlib.sha256(png).hexdigest()
-    if digest == last_hash and dib_bytes:
-        offer_selections(True)
-        reassert_left = 6
+    if digest == last_hash:
         return
     try:
         from gi.repository import GdkPixbuf
@@ -264,7 +461,110 @@ def ingest_png() -> None:
     logged_gets = set()
     offer_selections(True)
     reassert_left = 6
-    log(f"offered DIB/_ISL_DIB/PIXMAP ({len(dib_bytes)} bytes)")
+    log(f"offered DIB {pb.get_width()}x{pb.get_height()} ({len(dib_bytes)} bytes)")
+
+
+def publish_session_image(pb) -> None:
+    """Citrix → Wayland. Do not steal X11 from wfica."""
+    global pixbuf, last_hash, dib_bytes, reassert_left
+    png = pixbuf_to_png(pb)
+    if not png:
+        return
+    digest = hashlib.sha256(png).hexdigest()
+    if digest == last_hash:
+        return
+    last_hash = digest
+    pixbuf = pb
+    dib_bytes = pixbuf_to_dib(pb)
+    reassert_left = 0
+    wl_copy_png(png)
+    log(f"exported session image {pb.get_width()}x{pb.get_height()} to Wayland")
+
+
+def _requestor_xid(requestor) -> int:
+    from gi.repository import GdkX11
+
+    if requestor is None:
+        return 0
+    try:
+        return int(GdkX11.X11Window.get_xid(requestor))
+    except Exception:
+        try:
+            return int(requestor)
+        except Exception:
+            return 0
+
+
+def _atom_x(atom) -> int:
+    from gi.repository import GdkX11
+
+    if atom is None:
+        return 0
+    try:
+        return int(GdkX11.x11_atom_to_xatom(atom))
+    except Exception:
+        return 0
+
+
+def _atom_name(atom) -> str:
+    try:
+        return atom.name()
+    except Exception:
+        return ""
+
+
+def send_dib_property(event, payload: bytes) -> bool:
+    """Put the whole DIB on the requestor in one BIG-REQUESTS ChangeProperty."""
+    if x11_dpy is None or not payload:
+        return False
+    req = _requestor_xid(event.requestor)
+    target = _atom_x(event.target)
+    prop = _atom_x(event.property)
+    if prop == 0:
+        prop = target
+    if req == 0 or target == 0:
+        return False
+    buf = ctypes.create_string_buffer(payload, len(payload))
+    libX11.XChangeProperty(
+        x11_dpy,
+        req,
+        prop,
+        target,
+        8,
+        PropModeReplace,
+        buf,
+        len(payload),
+    )
+    libX11.XFlush(x11_dpy)
+    from gi.repository import Gdk
+
+    Gdk.selection_send_notify(
+        event.requestor,
+        event.selection,
+        event.target,
+        event.property if _atom_x(event.property) else event.target,
+        event.time,
+    )
+    return True
+
+
+def on_selection_request(_widget, event) -> bool:
+    global logged_gets
+    name = _atom_name(event.target)
+    if name not in logged_gets:
+        logged_gets.add(name)
+        log(f"selection-request {name}")
+    if name == "_ISL_DIB" and dib_bytes:
+        return send_dib_property(event, dib_bytes)
+    if name == "DIB" and dib_bytes:
+        return send_dib_property(event, as_cf_dib(dib_bytes))
+    if name == "_ISL_RGBQUAD":
+        return send_dib_property(event, bytes(ISL_RGBQUAD))
+    if name == "image/bmp" and dib_bytes:
+        cf = as_cf_dib(dib_bytes)
+        bmp = b"BM" + struct.pack("<IHHI", 14 + len(cf), 0, 0, 54) + cf
+        return send_dib_property(event, bmp)
+    return False
 
 
 def on_selection_get(_widget, selection_data, info, _time) -> None:
@@ -277,38 +577,201 @@ def on_selection_get(_widget, selection_data, info, _time) -> None:
     if name not in logged_gets:
         logged_gets.add(name)
         log(f"selection-get {name} info={info}")
-    if info == 3 or name == "PIXMAP":
-        if pixbuf is not None:
-            selection_data.set_pixbuf(pixbuf)
-        return
-    if not dib_bytes:
-        return
-    if info == 2:
-        payload = (
-            b"BM"
-            + struct.pack("<IHHI", 14 + len(dib_bytes), 0, 0, 14)
-            + dib_bytes
-        )
-        selection_data.set(target, 8, payload)
-        return
-    selection_data.set(target, 8, dib_bytes)
+    if info == 3 and pixbuf is not None:
+        selection_data.set_pixbuf(pixbuf)
+
+
+def on_selection_clear(_widget, event) -> bool:
+    global reassert_left, pulled_owner_xid, wfica_pull_tries
+    name = _atom_name(event.selection)
+    if name == "CLIPBOARD":
+        reassert_left = 0
+        pulled_owner_xid = 0
+        wfica_pull_tries = 0
+        from gi.repository import GLib
+
+        GLib.timeout_add(200, request_wfica_image)
+    return False
 
 
 def on_reassert() -> bool:
     global reassert_left
     if reassert_left <= 0 or not dib_bytes:
         return True
-    reassert_left -= 1
     from gi.repository import Gdk
 
+    if owner_is_wfica(Gdk.SELECTION_CLIPBOARD):
+        reassert_left = 0
+        return True
+    reassert_left -= 1
     if wfica_is_focused():
         return True
     if we_own(Gdk.SELECTION_CLIPBOARD):
         return True
-    if owner_is_wfica(Gdk.SELECTION_CLIPBOARD):
-        return True
     offer_selections(True)
     return True
+
+
+def request_wfica_image() -> bool:
+    global import_pending
+    from gi.repository import Gtk, Gdk, GLib
+
+    if import_pending or holder is None:
+        return False
+    if we_own(Gdk.SELECTION_CLIPBOARD):
+        return False
+    xid = selection_owner_xid("CLIPBOARD")
+    if not window_is_wfica(xid):
+        xid = selection_owner_xid("PRIMARY")
+        if not window_is_wfica(xid):
+            return False
+    import_pending = True
+    log(f"pull image from wfica owner 0x{xid:x}")
+
+    def finish_pixbuf(pb, src: str) -> None:
+        global import_pending, pulled_owner_xid, wfica_pull_tries
+        import_pending = False
+        if pb is None:
+            log(f"pull {src} empty")
+            return
+        pulled_owner_xid = xid
+        wfica_pull_tries = 0
+        log(f"pull {src} {pb.get_width()}x{pb.get_height()}")
+        publish_session_image(pb)
+
+    def got_image(_clip, pb) -> None:
+        finish_pixbuf(pb, "PIXMAP")
+
+    def got_plain_dib(_clip, sel_data) -> None:
+        raw = bytes(sel_data.get_data() or b"")
+        log(f"pull DIB {len(raw)} bytes")
+        pb = isl_dib_to_pixbuf(raw) if len(raw) >= 40 else None
+        if pb is not None:
+            finish_pixbuf(pb, "DIB")
+            return
+        clip.request_image(got_image)
+
+    def got_isl(_clip, sel_data) -> None:
+        raw = bytes(sel_data.get_data() or b"")
+        log(f"pull _ISL_DIB {len(raw)} bytes")
+        pb = isl_dib_to_pixbuf(raw) if len(raw) >= 40 else None
+        if pb is not None:
+            finish_pixbuf(pb, "_ISL_DIB")
+            return
+        if atom_dib is not None:
+            clip.request_contents(atom_dib, got_plain_dib)
+            return
+        clip.request_image(got_image)
+
+    def clear_pending() -> bool:
+        global import_pending
+        import_pending = False
+        return False
+
+    GLib.timeout_add(5000, clear_pending)
+    clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+    if atom_isl is None:
+        import_pending = False
+        return False
+    clip.request_contents(atom_isl, got_isl)
+    return False
+
+
+def poll_wfica_export() -> bool:
+    global pulled_owner_xid, wfica_pull_tries
+    from gi.repository import Gdk
+
+    if we_own(Gdk.SELECTION_CLIPBOARD):
+        pulled_owner_xid = holder_xid()
+        wfica_pull_tries = 0
+        return True
+    xid = selection_owner_xid("CLIPBOARD")
+    if not window_is_wfica(xid):
+        xid = selection_owner_xid("PRIMARY")
+    if not window_is_wfica(xid):
+        wfica_pull_tries = 0
+        return True
+    if xid == pulled_owner_xid:
+        return True
+    if import_pending:
+        return True
+    if wfica_pull_tries >= 12:
+        return True
+    wfica_pull_tries += 1
+    request_wfica_image()
+    return True
+
+
+def setup_xfixes(GLib) -> None:
+    """Notice wfica re-asserting CLIPBOARD for a new session copy."""
+    global xa_clipboard
+    try:
+        xfixes = ctypes.CDLL("libXfixes.so.3")
+    except OSError:
+        log("libXfixes missing; session copies may need a focus change")
+        return
+    xfixes.XFixesQueryExtension.restype = ctypes.c_int
+    xfixes.XFixesQueryExtension.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    evbase = ctypes.c_int()
+    errbase = ctypes.c_int()
+    if not xfixes.XFixesQueryExtension(
+        x11_dpy, ctypes.byref(evbase), ctypes.byref(errbase)
+    ):
+        return
+    xfixes.XFixesSelectSelectionInput.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    ]
+    libX11.XDefaultRootWindow.restype = ctypes.c_ulong
+    libX11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    libX11.XCreateSimpleWindow.restype = ctypes.c_ulong
+    libX11.XCreateSimpleWindow.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    ]
+    libX11.XConnectionNumber.restype = ctypes.c_int
+    libX11.XConnectionNumber.argtypes = [ctypes.c_void_p]
+    libX11.XPending.restype = ctypes.c_int
+    libX11.XPending.argtypes = [ctypes.c_void_p]
+    libX11.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    root = libX11.XDefaultRootWindow(x11_dpy)
+    win = libX11.XCreateSimpleWindow(x11_dpy, root, 0, 0, 1, 1, 0, 0, 0)
+    xa_clipboard = x_atom("CLIPBOARD")
+    mask = 1 | 2 | 4  # owner / destroy / client-close
+    xfixes.XFixesSelectSelectionInput(x11_dpy, win, xa_clipboard, mask)
+    xfixes.XFixesSelectSelectionInput(x11_dpy, win, XA_PRIMARY, mask)
+    libX11.XFlush(x11_dpy)
+    notify_type = int(evbase.value)
+    xfd = libX11.XConnectionNumber(x11_dpy)
+    xev = ctypes.create_string_buffer(256)
+
+    def on_x11(_fd, _cond) -> bool:
+        global pulled_owner_xid, wfica_pull_tries
+        while libX11.XPending(x11_dpy):
+            libX11.XNextEvent(x11_dpy, xev)
+            ev_type = struct.unpack_from("i", xev)[0]
+            if ev_type != notify_type:
+                continue
+            pulled_owner_xid = 0
+            wfica_pull_tries = 0
+            request_wfica_image()
+        return True
+
+    GLib.unix_fd_add_full(GLib.PRIORITY_DEFAULT, xfd, GLib.IOCondition.IN, on_x11)
+    log(f"XFixes selection notify on fd {xfd}")
 
 
 def notify_daemon() -> None:
@@ -350,20 +813,26 @@ def open_notify_fifo() -> int:
     return os.open(NOTIFY_PATH, os.O_RDWR | os.O_NONBLOCK)
 
 
-def daemon_mode() -> int:
-    global holder
+def daemon_mode(foreground: bool = False) -> int:
+    global holder, x11_dpy
+    global atom_dib, atom_isl, atom_bmp, atom_pix, atom_rgbquad
 
     if not os.environ.get("WAYLAND_DISPLAY"):
-        return 0
+        return 1 if foreground else 0
     if not os.environ.get("DISPLAY"):
-        return 0
+        return 1 if foreground else 0
 
-    daemonize()
+    if not foreground:
+        daemonize()
 
     lock_fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
+        return 0
+
+    x11_dpy = libX11.XOpenDisplay(None)
+    if not x11_dpy:
         return 0
 
     import gi
@@ -373,6 +842,8 @@ def daemon_mode() -> int:
     from gi.repository import Gtk, Gdk, GLib
 
     syslog.openlog("citrix-clip-bridge")
+    ext = libX11.XExtendedMaxRequestSize(x11_dpy)
+    log(f"X11 BIG-REQUESTS max {int(ext) * 4} bytes")
 
     holder = Gtk.Invisible()
     holder.show()
@@ -381,14 +852,19 @@ def daemon_mode() -> int:
     atom_isl = Gdk.Atom.intern("_ISL_DIB", False)
     atom_bmp = Gdk.Atom.intern("image/bmp", False)
     atom_pix = Gdk.Atom.intern("PIXMAP", False)
+    atom_rgbquad = Gdk.Atom.intern("_ISL_RGBQUAD", False)
     for sel in (Gdk.SELECTION_CLIPBOARD, Gdk.SELECTION_PRIMARY):
         Gtk.selection_clear_targets(holder, sel)
         Gtk.selection_add_target(holder, sel, atom_dib, 1)
         Gtk.selection_add_target(holder, sel, atom_isl, 1)
+        Gtk.selection_add_target(holder, sel, atom_rgbquad, 4)
         Gtk.selection_add_target(holder, sel, atom_bmp, 2)
         Gtk.selection_add_target(holder, sel, atom_pix, 3)
 
+    holder.connect("selection-request-event", on_selection_request)
     holder.connect("selection-get", on_selection_get)
+    holder.connect("selection-clear-event", on_selection_clear)
+    setup_xfixes(GLib)
 
     notify_fd = open_notify_fifo()
 
@@ -404,6 +880,7 @@ def daemon_mode() -> int:
         GLib.PRIORITY_DEFAULT, notify_fd, GLib.IOCondition.IN, on_notify
     )
     GLib.timeout_add(250, on_reassert)
+    GLib.timeout_add(400, poll_wfica_export)
 
     os.ftruncate(lock_fd, 0)
     os.lseek(lock_fd, 0, os.SEEK_SET)
@@ -441,15 +918,16 @@ def daemon_mode() -> int:
 
     signal.signal(signal.SIGTERM, on_exit)
     signal.signal(signal.SIGINT, on_exit)
-    log("watching Wayland image/png for X11 DIB/_ISL_DIB/PIXMAP")
+    log("watching Wayland image/png for X11 ISL_DIB (pixels at 0x428)")
     Gtk.main()
     return 0
 
 
 def main() -> int:
-    if sys.argv[1:] in (["--ingest"], ["--convert"]):
+    args = sys.argv[1:]
+    if args in (["--ingest"], ["--convert"]):
         return ingest_mode()
-    return daemon_mode()
+    return daemon_mode(foreground="--foreground" in args)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,16 @@
+[Unit]
+Description=Citrix Wayland/X11 clipboard bridge
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/opt/Citrix/ICAClient/util/citrix-clip-bridge --foreground
+Restart=on-failure
+RestartSec=2
+Environment=GDK_BACKEND=x11
+Environment=PATH=/usr/bin:/bin
+UnsetEnvironment=GTK_PATH GTK_EXE_PREFIX GTK_DATA_PREFIX LD_LIBRARY_PATH
+
+[Install]
+WantedBy=graphical-session.target
