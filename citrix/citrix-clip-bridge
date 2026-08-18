@@ -25,6 +25,7 @@ import struct
 import subprocess
 import sys
 import syslog
+import time
 
 # Must run before Gtk is imported. The wfica wrapper puts Citrix on
 # LD_LIBRARY_PATH / GTK_PATH, which breaks system PyGObject.
@@ -114,6 +115,11 @@ x11_dpy = None
 import_pending = False
 pulled_owner_xid = 0
 wfica_pull_tries = 0
+last_clip_owner = 0
+last_ingest_at = 0.0
+last_export_at = 0.0
+pull_cool_until = 0.0
+session_pull_done = False
 atom_dib = None
 atom_isl = None
 atom_bmp = None
@@ -393,16 +399,9 @@ def offer_selections(both: bool = True) -> None:
 
     if holder is None or not dib_bytes:
         return
-    if owner_is_wfica(Gdk.SELECTION_CLIPBOARD) and not we_own(
-        Gdk.SELECTION_CLIPBOARD
-    ):
-        return
     t = x11_now() or Gdk.CURRENT_TIME
     Gtk.selection_owner_set(holder, Gdk.SELECTION_PRIMARY, t)
     if both:
-        if wfica_is_focused() and not we_own(Gdk.SELECTION_CLIPBOARD):
-            if owner_is_wfica(Gdk.SELECTION_CLIPBOARD):
-                return
         Gtk.selection_owner_set(holder, Gdk.SELECTION_CLIPBOARD, t)
 
 
@@ -431,6 +430,8 @@ def wl_copy_png(png: bytes) -> None:
 
 def ingest_png() -> None:
     global dib_bytes, pixbuf, last_hash, reassert_left, logged_gets
+    global last_ingest_at, pull_cool_until, pulled_owner_xid, wfica_pull_tries
+    global session_pull_done
     try:
         png = open(PNG_PATH, "rb").read()
     except OSError:
@@ -439,6 +440,8 @@ def ingest_png() -> None:
         return
     digest = hashlib.sha256(png).hexdigest()
     if digest == last_hash:
+        return
+    if time.monotonic() - last_export_at < 3.0:
         return
     try:
         from gi.repository import GdkPixbuf
@@ -459,24 +462,32 @@ def ingest_png() -> None:
     pixbuf = pb
     last_hash = digest
     logged_gets = set()
+    last_ingest_at = time.monotonic()
+    pull_cool_until = last_ingest_at + 2.0
+    pulled_owner_xid = 0
+    wfica_pull_tries = 0
+    session_pull_done = False
     offer_selections(True)
-    reassert_left = 6
+    reassert_left = 8
     log(f"offered DIB {pb.get_width()}x{pb.get_height()} ({len(dib_bytes)} bytes)")
 
 
 def publish_session_image(pb) -> None:
     """Citrix → Wayland. Do not steal X11 from wfica."""
-    global pixbuf, last_hash, dib_bytes, reassert_left
+    global pixbuf, last_hash, dib_bytes, reassert_left, last_export_at, session_pull_done
     png = pixbuf_to_png(pb)
     if not png:
         return
     digest = hashlib.sha256(png).hexdigest()
     if digest == last_hash:
+        session_pull_done = True
         return
     last_hash = digest
     pixbuf = pb
     dib_bytes = pixbuf_to_dib(pb)
     reassert_left = 0
+    session_pull_done = True
+    last_export_at = time.monotonic()
     wl_copy_png(png)
     log(f"exported session image {pb.get_width()}x{pb.get_height()} to Wayland")
 
@@ -581,16 +592,29 @@ def on_selection_get(_widget, selection_data, info, _time) -> None:
         selection_data.set_pixbuf(pixbuf)
 
 
-def on_selection_clear(_widget, event) -> bool:
-    global reassert_left, pulled_owner_xid, wfica_pull_tries
-    name = _atom_name(event.selection)
-    if name == "CLIPBOARD":
-        reassert_left = 0
-        pulled_owner_xid = 0
-        wfica_pull_tries = 0
-        from gi.repository import GLib
+def selection_bytes(sel_data) -> bytes:
+    try:
+        if sel_data is None or sel_data.get_length() <= 0:
+            return b""
+        raw = sel_data.get_data()
+        if not raw:
+            return b""
+        return bytes(raw)
+    except Exception:
+        return b""
 
-        GLib.timeout_add(200, request_wfica_image)
+
+def on_selection_clear(_widget, event) -> bool:
+    global reassert_left, session_pull_done
+    name = _atom_name(event.selection)
+    if name != "CLIPBOARD":
+        return False
+    from gi.repository import Gdk, GLib
+
+    if owner_is_wfica(Gdk.SELECTION_CLIPBOARD):
+        reassert_left = 0
+        session_pull_done = False
+        GLib.timeout_add(300, request_wfica_image)
     return False
 
 
@@ -600,12 +624,7 @@ def on_reassert() -> bool:
         return True
     from gi.repository import Gdk
 
-    if owner_is_wfica(Gdk.SELECTION_CLIPBOARD):
-        reassert_left = 0
-        return True
     reassert_left -= 1
-    if wfica_is_focused():
-        return True
     if we_own(Gdk.SELECTION_CLIPBOARD):
         return True
     offer_selections(True)
@@ -613,29 +632,45 @@ def on_reassert() -> bool:
 
 
 def request_wfica_image() -> bool:
-    global import_pending
+    global import_pending, pull_cool_until, wfica_pull_tries
     from gi.repository import Gtk, Gdk, GLib
 
+    now = time.monotonic()
     if import_pending or holder is None:
+        return False
+    if session_pull_done:
+        return False
+    if now < pull_cool_until:
+        return False
+    if now - last_ingest_at < 2.0:
+        return False
+    if reassert_left > 0:
         return False
     if we_own(Gdk.SELECTION_CLIPBOARD):
         return False
     xid = selection_owner_xid("CLIPBOARD")
     if not window_is_wfica(xid):
-        xid = selection_owner_xid("PRIMARY")
-        if not window_is_wfica(xid):
-            return False
+        return False
     import_pending = True
+    pull_cool_until = now + 0.8
     log(f"pull image from wfica owner 0x{xid:x}")
 
     def finish_pixbuf(pb, src: str) -> None:
-        global import_pending, pulled_owner_xid, wfica_pull_tries
+        global import_pending, pulled_owner_xid, wfica_pull_tries, pull_cool_until
         import_pending = False
         if pb is None:
-            log(f"pull {src} empty")
+            wfica_pull_tries += 1
+            delay = 8.0 if wfica_pull_tries >= 3 else 1.5
+            pull_cool_until = time.monotonic() + delay
+            if wfica_pull_tries >= 3:
+                pulled_owner_xid = xid
+                log(f"pull {src} empty; backing off")
+            else:
+                log(f"pull {src} empty; retry later")
             return
         pulled_owner_xid = xid
         wfica_pull_tries = 0
+        pull_cool_until = time.monotonic() + 1.0
         log(f"pull {src} {pb.get_width()}x{pb.get_height()}")
         publish_session_image(pb)
 
@@ -643,7 +678,7 @@ def request_wfica_image() -> bool:
         finish_pixbuf(pb, "PIXMAP")
 
     def got_plain_dib(_clip, sel_data) -> None:
-        raw = bytes(sel_data.get_data() or b"")
+        raw = selection_bytes(sel_data)
         log(f"pull DIB {len(raw)} bytes")
         pb = isl_dib_to_pixbuf(raw) if len(raw) >= 40 else None
         if pb is not None:
@@ -652,7 +687,7 @@ def request_wfica_image() -> bool:
         clip.request_image(got_image)
 
     def got_isl(_clip, sel_data) -> None:
-        raw = bytes(sel_data.get_data() or b"")
+        raw = selection_bytes(sel_data)
         log(f"pull _ISL_DIB {len(raw)} bytes")
         pb = isl_dib_to_pixbuf(raw) if len(raw) >= 40 else None
         if pb is not None:
@@ -678,26 +713,12 @@ def request_wfica_image() -> bool:
 
 
 def poll_wfica_export() -> bool:
-    global pulled_owner_xid, wfica_pull_tries
     from gi.repository import Gdk
 
+    if session_pull_done or reassert_left > 0:
+        return True
     if we_own(Gdk.SELECTION_CLIPBOARD):
-        pulled_owner_xid = holder_xid()
-        wfica_pull_tries = 0
         return True
-    xid = selection_owner_xid("CLIPBOARD")
-    if not window_is_wfica(xid):
-        xid = selection_owner_xid("PRIMARY")
-    if not window_is_wfica(xid):
-        wfica_pull_tries = 0
-        return True
-    if xid == pulled_owner_xid:
-        return True
-    if import_pending:
-        return True
-    if wfica_pull_tries >= 12:
-        return True
-    wfica_pull_tries += 1
     request_wfica_image()
     return True
 
@@ -752,22 +773,34 @@ def setup_xfixes(GLib) -> None:
     xa_clipboard = x_atom("CLIPBOARD")
     mask = 1 | 2 | 4  # owner / destroy / client-close
     xfixes.XFixesSelectSelectionInput(x11_dpy, win, xa_clipboard, mask)
-    xfixes.XFixesSelectSelectionInput(x11_dpy, win, XA_PRIMARY, mask)
     libX11.XFlush(x11_dpy)
     notify_type = int(evbase.value)
     xfd = libX11.XConnectionNumber(x11_dpy)
     xev = ctypes.create_string_buffer(256)
 
     def on_x11(_fd, _cond) -> bool:
-        global pulled_owner_xid, wfica_pull_tries
+        global last_clip_owner, pulled_owner_xid, wfica_pull_tries, session_pull_done
+        saw = False
         while libX11.XPending(x11_dpy):
             libX11.XNextEvent(x11_dpy, xev)
-            ev_type = struct.unpack_from("i", xev)[0]
-            if ev_type != notify_type:
-                continue
+            if struct.unpack_from("i", xev)[0] == notify_type:
+                saw = True
+        if not saw:
+            return True
+        xid = selection_owner_xid("CLIPBOARD")
+        prev = last_clip_owner
+        if xid == last_clip_owner:
+            return True
+        last_clip_owner = xid
+        if xid == 0 or xid == holder_xid():
+            return True
+        if not window_is_wfica(xid):
+            return True
+        if prev != xid:
+            session_pull_done = False
             pulled_owner_xid = 0
             wfica_pull_tries = 0
-            request_wfica_image()
+        request_wfica_image()
         return True
 
     GLib.unix_fd_add_full(GLib.PRIORITY_DEFAULT, xfd, GLib.IOCondition.IN, on_x11)
@@ -880,7 +913,7 @@ def daemon_mode(foreground: bool = False) -> int:
         GLib.PRIORITY_DEFAULT, notify_fd, GLib.IOCondition.IN, on_notify
     )
     GLib.timeout_add(250, on_reassert)
-    GLib.timeout_add(400, poll_wfica_export)
+    GLib.timeout_add(1500, poll_wfica_export)
 
     os.ftruncate(lock_fd, 0)
     os.lseek(lock_fd, 0, os.SEEK_SET)
