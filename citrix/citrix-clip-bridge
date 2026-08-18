@@ -1,34 +1,456 @@
-#!/bin/sh
-# Copy Wayland image/png (Spectacle, etc.) onto the X11 CLIPBOARD as DIB.
-# wfica only imports XA_DIB/XA_PIXMAP from X11, so Wayland screenshots never
-# reach Windows (or nested MSTSC) without this conversion.
-set -eu
+#!/usr/bin/python3
+"""Offer Wayland image/png captures to X11 as CF_DIB/PIXMAP for Citrix wfica.
 
-have() { command -v "$1" >/dev/null 2>&1; }
+wfica only imports a short X11 target list (DIB, _ISL_DIB, PIXMAP, text).
+KDE copies screenshots as Wayland image/png; XWayland re-offers MIME types,
+which Citrix logs as "No interesting targets".
 
-png_to_dib() {
-  if have magick; then
-    magick png:- bmp:-
-  elif have convert; then
-    convert png:- bmp:-
-  elif have ffmpeg; then
-    ffmpeg -v error -f image2pipe -vcodec png -i pipe:0 -f bmp pipe:1
-  else
-    return 1
-  fi | tail -c +15
-}
+This process daemonizes (ignores SIGHUP), owns CLIPBOARD/PRIMARY with Gtk,
+and answers TARGETS, TIMESTAMP, DIB, _ISL_DIB, and PIXMAP. Ingest is a FIFO
+notify, not SIGUSR1: Python's default SIGUSR1 handler would kill the daemon.
+"""
+from __future__ import annotations
 
-if [ "${1:-}" = --convert ]; then
-  tmp=$(mktemp)
-  trap 'rm -f "$tmp"' EXIT
-  if png_to_dib >"$tmp" && [ -s "$tmp" ]; then
-    xclip -selection clipboard -t DIB -i "$tmp"
-  fi
-  exit 0
-fi
+import fcntl
+import hashlib
+import os
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import syslog
 
-have wl-paste && have xclip || exit 0
-[ -n "${WAYLAND_DISPLAY:-}" ] || exit 0
-have magick || have convert || have ffmpeg || exit 0
+# Must run before Gtk is imported. The wfica wrapper puts Citrix on
+# LD_LIBRARY_PATH / GTK_PATH, which breaks system PyGObject.
+os.environ["GDK_BACKEND"] = "x11"
+os.environ.setdefault("DISPLAY", ":0")
+for _key in ("GTK_PATH", "GTK_EXE_PREFIX", "GTK_DATA_PREFIX"):
+    _val = os.environ.get(_key, "")
+    if "Citrix" in _val or "ICAClient" in _val:
+        os.environ.pop(_key, None)
+_ldlp = os.environ.get("LD_LIBRARY_PATH", "")
+if _ldlp:
+    _keep = [
+        p
+        for p in _ldlp.split(":")
+        if p and "Citrix" not in p and "ICAClient" not in p
+    ]
+    if _keep:
+        os.environ["LD_LIBRARY_PATH"] = ":".join(_keep)
+    else:
+        os.environ.pop("LD_LIBRARY_PATH", None)
 
-exec wl-paste --watch --type image/png "$0" --convert
+
+RUNDIR = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+LOCK_PATH = os.path.join(RUNDIR, "citrix-clip-bridge.lock")
+PID_PATH = os.path.join(RUNDIR, "citrix-clip-bridge.pid")
+PNG_PATH = os.path.join(RUNDIR, "citrix-clip-bridge.png")
+NOTIFY_PATH = os.path.join(RUNDIR, "citrix-clip-bridge.notify")
+
+dib_bytes = b""
+pixbuf = None
+last_hash = ""
+reassert_left = 0
+logged_gets = set()
+holder = None
+
+
+def log(msg: str) -> None:
+    try:
+        syslog.syslog(syslog.LOG_INFO | syslog.LOG_USER, msg)
+    except Exception:
+        pass
+
+
+def daemonize() -> None:
+    if os.fork() > 0:
+        os._exit(0)
+    os.setsid()
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    if os.fork() > 0:
+        os._exit(0)
+    os.chdir("/")
+    fd = os.open(os.devnull, os.O_RDWR)
+    os.dup2(fd, 0)
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    if fd > 2:
+        os.close(fd)
+
+
+def _manual_dib(pb) -> bytes:
+    w, h = pb.get_width(), pb.get_height()
+    nch = pb.get_n_channels()
+    rs = pb.get_rowstride()
+    pixels = bytes(pb.get_pixels())
+    stride = (w * 3 + 3) & ~3
+    out = bytearray(40 + stride * h)
+    struct.pack_into(
+        "<IiiHHIIiiII",
+        out,
+        0,
+        40,
+        w,
+        h,
+        1,
+        24,
+        0,
+        stride * h,
+        0,
+        0,
+        0,
+        0,
+    )
+    for y in range(h):
+        src = (h - 1 - y) * rs
+        dst = 40 + y * stride
+        for x in range(w):
+            i = src + x * nch
+            o = dst + x * 3
+            out[o] = pixels[i + 2]
+            out[o + 1] = pixels[i + 1]
+            out[o + 2] = pixels[i]
+    return bytes(out)
+
+
+def pixbuf_to_dib(pb) -> bytes:
+    """Classic CF_DIB: BITMAPINFOHEADER (biSize=40), 24bpp BI_RGB, bottom-up BGR."""
+    from gi.repository import GdkPixbuf
+
+    if pb.get_has_alpha():
+        w, h = pb.get_width(), pb.get_height()
+        bg = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, w, h)
+        bg.fill(0xFFFFFFFF)
+        pb.composite(
+            bg, 0, 0, w, h, 0, 0, 1.0, 1.0, GdkPixbuf.InterpType.NEAREST, 255
+        )
+        pb = bg
+    try:
+        ok, buf = pb.save_to_bufferv("bmp", [], [])
+        data = bytes(buf) if buf is not None else b""
+        if ok and data[:2] == b"BM" and len(data) >= 54:
+            off = struct.unpack_from("<I", data, 10)[0]
+            if 14 <= off <= len(data) - 40:
+                dib = data[off:]
+                bi_size, _w, _h, _planes, bpp = struct.unpack_from("<IiiHH", dib, 0)
+                if bi_size == 40 and bpp == 24:
+                    return dib
+    except Exception:
+        pass
+    return _manual_dib(pb)
+
+
+def wfica_wm_class(text: str) -> bool:
+    return "Wfica" in text or "wfica" in text
+
+
+def xprop_class(xid: str) -> str:
+    try:
+        r = subprocess.run(
+            ["xprop", "-id", xid, "WM_CLASS"],
+            capture_output=True,
+            text=True,
+            timeout=0.4,
+        )
+        return r.stdout or ""
+    except Exception:
+        return ""
+
+
+def wfica_is_focused() -> bool:
+    try:
+        r = subprocess.run(
+            ["xprop", "-root", "_NET_ACTIVE_WINDOW"],
+            capture_output=True,
+            text=True,
+            timeout=0.4,
+        )
+    except Exception:
+        return False
+    xid = None
+    for part in r.stdout.replace(",", " ").split():
+        if part.startswith("0x"):
+            xid = part
+    if not xid:
+        return False
+    return wfica_wm_class(xprop_class(xid))
+
+
+def owner_is_wfica(selection) -> bool:
+    from gi.repository import Gdk, GdkX11
+
+    try:
+        owner = Gdk.selection_owner_get(selection)
+        if owner is None:
+            return False
+        xid = hex(GdkX11.X11Window.get_xid(owner))
+    except Exception:
+        return False
+    return wfica_wm_class(xprop_class(xid))
+
+
+def we_own(selection) -> bool:
+    from gi.repository import Gdk
+
+    if holder is None:
+        return False
+    try:
+        owner = Gdk.selection_owner_get(selection)
+        return owner is not None and owner == holder.get_window()
+    except Exception:
+        return False
+
+
+def x11_now() -> int:
+    from gi.repository import GdkX11
+
+    if holder is None:
+        return 0
+    win = holder.get_window()
+    if win is None:
+        return 0
+    try:
+        return int(GdkX11.x11_get_server_time(win))
+    except Exception:
+        return 0
+
+
+def offer_selections(both: bool = True) -> None:
+    from gi.repository import Gtk, Gdk
+
+    if holder is None or not dib_bytes:
+        return
+    t = x11_now() or Gdk.CURRENT_TIME
+    Gtk.selection_owner_set(holder, Gdk.SELECTION_PRIMARY, t)
+    if both:
+        if wfica_is_focused() and not we_own(Gdk.SELECTION_CLIPBOARD):
+            if owner_is_wfica(Gdk.SELECTION_CLIPBOARD):
+                return
+        Gtk.selection_owner_set(holder, Gdk.SELECTION_CLIPBOARD, t)
+
+
+def ingest_png() -> None:
+    global dib_bytes, pixbuf, last_hash, reassert_left, logged_gets
+    try:
+        png = open(PNG_PATH, "rb").read()
+    except OSError:
+        return
+    if not png:
+        return
+    digest = hashlib.sha256(png).hexdigest()
+    if digest == last_hash and dib_bytes:
+        offer_selections(True)
+        reassert_left = 6
+        return
+    try:
+        from gi.repository import GdkPixbuf
+
+        loader = GdkPixbuf.PixbufLoader.new_with_type("png")
+        loader.write(png)
+        loader.close()
+        pb = loader.get_pixbuf()
+        if pb is None:
+            return
+        dib = pixbuf_to_dib(pb)
+    except Exception as exc:
+        log(f"png to DIB failed: {exc}")
+        return
+    if len(dib) < 40:
+        return
+    dib_bytes = dib
+    pixbuf = pb
+    last_hash = digest
+    logged_gets = set()
+    offer_selections(True)
+    reassert_left = 6
+    log(f"offered DIB/_ISL_DIB/PIXMAP ({len(dib_bytes)} bytes)")
+
+
+def on_selection_get(_widget, selection_data, info, _time) -> None:
+    global logged_gets
+    target = selection_data.get_target()
+    try:
+        name = target.name()
+    except Exception:
+        name = "?"
+    if name not in logged_gets:
+        logged_gets.add(name)
+        log(f"selection-get {name} info={info}")
+    if info == 3 or name == "PIXMAP":
+        if pixbuf is not None:
+            selection_data.set_pixbuf(pixbuf)
+        return
+    if not dib_bytes:
+        return
+    if info == 2:
+        payload = (
+            b"BM"
+            + struct.pack("<IHHI", 14 + len(dib_bytes), 0, 0, 14)
+            + dib_bytes
+        )
+        selection_data.set(target, 8, payload)
+        return
+    selection_data.set(target, 8, dib_bytes)
+
+
+def on_reassert() -> bool:
+    global reassert_left
+    if reassert_left <= 0 or not dib_bytes:
+        return True
+    reassert_left -= 1
+    from gi.repository import Gdk
+
+    if wfica_is_focused():
+        return True
+    if we_own(Gdk.SELECTION_CLIPBOARD):
+        return True
+    if owner_is_wfica(Gdk.SELECTION_CLIPBOARD):
+        return True
+    offer_selections(True)
+    return True
+
+
+def notify_daemon() -> None:
+    try:
+        fd = os.open(NOTIFY_PATH, os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            os.write(fd, b"x")
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        log(f"ingest notify failed: {exc}")
+
+
+def ingest_mode() -> int:
+    png = sys.stdin.buffer.read()
+    if not png:
+        return 0
+    try:
+        with open(PNG_PATH, "wb") as fh:
+            fh.write(png)
+            fh.flush()
+            os.fsync(fh.fileno())
+        notify_daemon()
+    except Exception as exc:
+        log(f"ingest failed: {exc}")
+    return 0
+
+
+def open_notify_fifo() -> int:
+    try:
+        st = os.lstat(NOTIFY_PATH)
+        if not stat.S_ISFIFO(st.st_mode):
+            os.unlink(NOTIFY_PATH)
+            st = None
+    except FileNotFoundError:
+        st = None
+    if st is None:
+        os.mkfifo(NOTIFY_PATH, 0o600)
+    return os.open(NOTIFY_PATH, os.O_RDWR | os.O_NONBLOCK)
+
+
+def daemon_mode() -> int:
+    global holder
+
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        return 0
+    if not os.environ.get("DISPLAY"):
+        return 0
+
+    daemonize()
+
+    lock_fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return 0
+
+    import gi
+
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import Gtk, Gdk, GLib
+
+    syslog.openlog("citrix-clip-bridge")
+
+    holder = Gtk.Invisible()
+    holder.show()
+
+    atom_dib = Gdk.Atom.intern("DIB", False)
+    atom_isl = Gdk.Atom.intern("_ISL_DIB", False)
+    atom_bmp = Gdk.Atom.intern("image/bmp", False)
+    atom_pix = Gdk.Atom.intern("PIXMAP", False)
+    for sel in (Gdk.SELECTION_CLIPBOARD, Gdk.SELECTION_PRIMARY):
+        Gtk.selection_clear_targets(holder, sel)
+        Gtk.selection_add_target(holder, sel, atom_dib, 1)
+        Gtk.selection_add_target(holder, sel, atom_isl, 1)
+        Gtk.selection_add_target(holder, sel, atom_bmp, 2)
+        Gtk.selection_add_target(holder, sel, atom_pix, 3)
+
+    holder.connect("selection-get", on_selection_get)
+
+    notify_fd = open_notify_fifo()
+
+    def on_notify(fd, _condition) -> bool:
+        try:
+            os.read(fd, 4096)
+        except OSError:
+            pass
+        ingest_png()
+        return True
+
+    GLib.unix_fd_add_full(
+        GLib.PRIORITY_DEFAULT, notify_fd, GLib.IOCondition.IN, on_notify
+    )
+    GLib.timeout_add(250, on_reassert)
+
+    os.ftruncate(lock_fd, 0)
+    os.lseek(lock_fd, 0, os.SEEK_SET)
+    os.write(lock_fd, f"{os.getpid()}\n".encode())
+    os.fsync(lock_fd)
+    with open(PID_PATH, "w", encoding="utf-8") as fh:
+        fh.write(str(os.getpid()))
+
+    watch = subprocess.Popen(
+        [
+            "wl-paste",
+            "--type",
+            "image/png",
+            "--watch",
+            sys.executable,
+            os.path.abspath(sys.argv[0]),
+            "--ingest",
+        ],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    def on_exit(_signum=None, _frame=None) -> None:
+        try:
+            watch.terminate()
+        except Exception:
+            pass
+        try:
+            os.unlink(PID_PATH)
+        except OSError:
+            pass
+        Gtk.main_quit()
+
+    signal.signal(signal.SIGTERM, on_exit)
+    signal.signal(signal.SIGINT, on_exit)
+    log("watching Wayland image/png for X11 DIB/_ISL_DIB/PIXMAP")
+    Gtk.main()
+    return 0
+
+
+def main() -> int:
+    if sys.argv[1:] in (["--ingest"], ["--convert"]):
+        return ingest_mode()
+    return daemon_mode()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

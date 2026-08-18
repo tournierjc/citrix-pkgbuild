@@ -1,12 +1,12 @@
 pkgname=icaclient-bin
 pkgver=26.04.10.1
-pkgrel=2
+pkgrel=6
 pkgdesc="Citrix ICA Client (repackaged vendor RPM, no compilation)"
 arch=('x86_64')
 url="https://www.citrix.com/downloads/workspace-app/linux/workspace-app-for-linux-latest.html"
 license=('custom:Citrix')
 depends=(
-  bash bubblewrap xclip wl-clipboard imagemagick
+  bash bubblewrap python-gobject wl-clipboard xorg-xprop
   libxss libxrandr libxcursor libxcomposite libxdamage libxfixes libxinerama libxtst
   alsa-lib libx11 libxcb nss gtk3 libsoup webkit2gtk-4.1
 )
@@ -214,11 +214,14 @@ export GTK_PATH="${ICAROOT}/gtk${GTK_PATH:+:${GTK_PATH}}"
 CLIENTFILE="${ICAROOT}/config/wfclient.ini"
 PROTOCOLFILE="${ICAROOT}/config/module.ini"
 
-bpid=
+# Isolate the clip bridge from Citrix LD_LIBRARY_PATH/GTK_PATH so system Gtk works.
 if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -x "$ICAROOT/util/citrix-clip-bridge" ]; then
-  "$ICAROOT/util/citrix-clip-bridge" &
-  bpid=$!
-  trap 'kill "$bpid" 2>/dev/null' EXIT INT TERM
+    setsid env -u GTK_PATH -u GTK_EXE_PREFIX -u GTK_DATA_PREFIX -u LD_LIBRARY_PATH \
+      GDK_BACKEND=x11 DISPLAY="${DISPLAY:-:0}" \
+      WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+      XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+      HOME="${HOME:-}" PATH="/usr/bin:/bin" \
+      "$ICAROOT/util/citrix-clip-bridge" >/dev/null 2>&1 &
 fi
 
 filearg=
@@ -234,11 +237,7 @@ else
   set -- -icaroot "$ICAROOT" -protocolfile "$PROTOCOLFILE" -clientfile "$CLIENTFILE" "$@"
 fi
 
-if [ -n "$bpid" ]; then
-  "$ICAROOT/wfica" "$@"
-else
-  exec "$ICAROOT/wfica" "$@"
-fi
+exec "$ICAROOT/wfica" "$@"
 EOF
   chmod 755 "$pkgdir/usr/bin/wfica"
 
