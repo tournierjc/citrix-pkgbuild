@@ -1,6 +1,6 @@
 pkgname=icaclient-bin
 pkgver=26.04.10.1
-pkgrel=18
+pkgrel=19
 pkgdesc="Citrix ICA Client (repackaged vendor RPM, no compilation)"
 arch=('x86_64')
 url="https://www.citrix.com/downloads/workspace-app/linux/workspace-app-for-linux-latest.html"
@@ -202,6 +202,16 @@ PY
   done
   for ini in "$root/config/All_Regions.ini" "$root/config/All_Regions_desktoplock.ini"; do
     _ini_set "$ini" 'Virtual Channels\Thinwire Graphics' HWAccelerationEnabled True
+    # Empty KeyboardLayout= is unrestricted, so a StoreFront ICA can force US
+    # QWERTY onto nested MSTSC / Winlogon. Pin the AZERTY scancode + EUKS path.
+    _ini_set "$ini" 'Virtual Channels\Keyboard' KeyboardLayout French
+    _ini_set "$ini" 'Virtual Channels\Keyboard' KeyboardEventMode Scancode
+    _ini_set "$ini" 'Virtual Channels\Keyboard' KeyboardSyncMode Once
+    _ini_set "$ini" 'Virtual Channels\Keyboard' KeyboardMappingFile automatic.kbd
+    _ini_set "$ini" 'Virtual Channels\Keyboard' KeyboardSendLocale True
+    _ini_set "$ini" 'Virtual Channels\Keyboard' UseEUKS 2
+    _ini_set "$ini" 'Virtual Channels\Keyboard' UseEUKSforASCII True
+    _ini_set "$ini" 'Virtual Channels\Keyboard' ScancodeEnabled True
   done
 
   # Force the same keyboard defaults in appsrv.ini as well; some Citrix flows

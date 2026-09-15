@@ -47,6 +47,9 @@ Packaged `wfclient.ini` uses:
 - `UseEUKS=2`, `UseEUKSforASCII=True`, `KeyboardSendLocale=True`
 - `MouseSendsControlV=False`
 
+Those keyboard values are also locked in `All_Regions.ini`, so a StoreFront ICA
+file cannot switch the session to US QWERTY (nested MSTSC / Winlogon).
+
 The Windows VDA logon screen often stays US QWERTY until the user profile
 loads. `UseEUKSforASCII` sends letters as Unicode so AZERTY still types on
 that screen. For a permanent logon-layout fix, copy the French layout to the

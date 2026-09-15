@@ -45,4 +45,4 @@ else
     "$@"
 fi
 
-exec -a wfica "$REALWFICA" "$@"
+exec -a "$ICAROOT/wfica" "$REALWFICA" "$@"
