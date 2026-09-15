@@ -1,6 +1,6 @@
 pkgname=icaclient-bin
 pkgver=26.04.10.1
-pkgrel=15
+pkgrel=16
 pkgdesc="Citrix ICA Client (repackaged vendor RPM, no compilation)"
 arch=('x86_64')
 url="https://www.citrix.com/downloads/workspace-app/linux/workspace-app-for-linux-latest.html"
@@ -9,6 +9,7 @@ depends=(
   bash bubblewrap python-gobject wl-clipboard xorg-xprop
   libxss libxrandr libxcursor libxcomposite libxdamage libxfixes libxinerama libxtst
   alsa-lib libx11 libxcb nss gtk3 libsoup webkit2gtk-4.1
+  libva libva-nvidia-driver
 )
 makedepends=(rpm-tools cpio)
 optdepends=(
@@ -33,12 +34,12 @@ if [[ -z "$_dl_rel" ]]; then
 fi
 
 if [[ -n "$_dl_rel" ]]; then
-  source=("${_rpm_file}::https:${_dl_rel}" "citrix-clip-bridge" "citrix-clip-bridge.service")
+  source=("${_rpm_file}::https:${_dl_rel}" "citrix-clip-bridge" "citrix-clip-bridge.service" "wfica")
 else
-  source=("${_rpm_file}" "citrix-clip-bridge" "citrix-clip-bridge.service")
+  source=("${_rpm_file}" "citrix-clip-bridge" "citrix-clip-bridge.service" "wfica")
 fi
 noextract=("${_rpm_file}")
-sha256sums=('c29820638ef5924233dd7546058e0ff662aae5c2a2e280c8eb900246908d9f25' 'SKIP' 'SKIP')
+sha256sums=('c29820638ef5924233dd7546058e0ff662aae5c2a2e280c8eb900246908d9f25' 'SKIP' 'SKIP' 'SKIP')
 install=icaclient-bin.install
 options=(!strip)
 
@@ -146,6 +147,42 @@ EOF
       sed -i '/^\[WFClient\]/a MouseSendsControlV=False' "$root/config/wfclient.ini"
   fi
 
+  # Insert or replace a key in an INI section.
+  _ini_set() {
+    local file=$1 section=$2 key=$3 value=$4
+    [[ -f "$file" ]] || return 0
+    if ! grep -q "^\[${section}\]" "$file"; then
+      printf '\n[%s]\n' "$section" >> "$file"
+    fi
+    if grep -q "^${key} *=" "$file"; then
+      sed -i "s|^${key} *=.*|${key}=${value}|" "$file"
+    else
+      sed -i "/^\[${section}\]/a ${key}=${value}" "$file"
+    fi
+  }
+
+  # Pin a single 3840x2160 session. Dual 4K (7680x2209) forces CPU H.264
+  # because VAAPI/NVDEC maxes out at ~4096x4096. ICA files often send
+  # DesiredHRES=4294967295 (all monitors); a single All_Regions value wins.
+  local ini
+  for ini in "$root/config/wfclient.ini"; do
+    _ini_set "$ini" WFClient MultiMonitorSelectionEnabled False
+    _ini_set "$ini" Thinwire3.0 DesiredHRES 3840
+    _ini_set "$ini" Thinwire3.0 DesiredVRES 2160
+    _ini_set "$ini" Thinwire3.0 UseFullScreen True
+    _ini_set "$ini" Thinwire3.0 OpenGLEnabled True
+    _ini_set "$ini" Thinwire3.0 HWAccelerationEnabled True
+    _ini_set "$ini" Thinwire3.0 H264Enabled True
+    _ini_set "$ini" Thinwire3.0 H265Enabled True
+    _ini_set "$ini" Thinwire3.0 DirectDecode True
+  done
+  for ini in "$root/config/All_Regions.ini" "$root/config/All_Regions_desktoplock.ini"; do
+    _ini_set "$ini" 'Virtual Channels\Thinwire Graphics' DesiredHRES 3840
+    _ini_set "$ini" 'Virtual Channels\Thinwire Graphics' DesiredVRES 2160
+    _ini_set "$ini" 'Virtual Channels\Thinwire Graphics' HWAccelerationEnabled True
+    _ini_set "$ini" 'Virtual Channels\Thinwire Graphics' MultiMonitorSelectionEnabled False
+  done
+
   # Force the same keyboard defaults in appsrv.ini as well; some Citrix flows
   # still consult [WFClient] there.
   if [[ -f "$root/config/appsrv.ini" ]]; then
@@ -208,44 +245,41 @@ EOF
 
   install -d "$pkgdir/usr/bin"
 
-  # Match the vendor-generated launcher logic from integrate.sh:
-  # set ICAROOT + LD_LIBRARY_PATH, then call wfica with -file for ICA files.
+  # Selfservice and .ica mime launches both exec $ICAROOT/wfica. Keep the
+  # vendor binary as wfica.real and install our wrapper under the original name.
+  mv "$root/wfica" "$root/wfica.real"
+  chmod 755 "$root/wfica.real"
+  install -Dm755 "$srcdir/wfica" "$root/wfica"
+
+  # Upstream wfica disables VAAPI whenever NVML reports an NVIDIA GPU
+  # ("Hardware decoding disabled because Nvidia GPU is installed"), then
+  # falls back to CPU H.264. Patch IsNvidiaGpuInstalled to return false so
+  # libctxVideoDecoder.so can use h264_vaapi via libva-nvidia-driver/NVDEC.
+  python3 - "$root/wfica.real" <<'PY'
+import pathlib, subprocess, sys
+
+path = pathlib.Path(sys.argv[1])
+nm = subprocess.check_output(["nm", "-D", str(path)], text=True)
+addr = None
+for line in nm.splitlines():
+    parts = line.split()
+    if len(parts) >= 3 and parts[-1] == "IsNvidiaGpuInstalled" and parts[1] == "T":
+        addr = int(parts[0], 16)
+        break
+if addr is None:
+    sys.exit("IsNvidiaGpuInstalled not found in wfica.real")
+data = bytearray(path.read_bytes())
+# ELF LOAD is mapped 1:1 from file offset 0 for this PIE binary.
+if data[addr : addr + 2] != bytes((0x41, 0x54)):  # push %r12
+    sys.exit(f"unexpected prologue at {addr:#x}: {data[addr:addr+8].hex()}")
+data[addr : addr + 3] = bytes((0x31, 0xC0, 0xC3))  # xor %eax,%eax; ret
+path.write_bytes(data)
+print(f"patched IsNvidiaGpuInstalled at {addr:#x}")
+PY
+
   cat > "$pkgdir/usr/bin/wfica" <<'EOF'
 #!/bin/sh
-ICAROOT=/opt/Citrix/ICAClient
-export ICAROOT
-export LD_LIBRARY_PATH="${ICAROOT}/lib:${ICAROOT}/Webkit2gtk4.0/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-export GTK_PATH="${ICAROOT}/gtk${GTK_PATH:+:${GTK_PATH}}"
-CLIENTFILE="${ICAROOT}/config/wfclient.ini"
-PROTOCOLFILE="${ICAROOT}/config/module.ini"
-
-# Clip bridge is a user systemd service. Keep a fallback start if it is not
-# running yet; do not kill a systemd-managed instance on every wfica launch.
-if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -x "$ICAROOT/util/citrix-clip-bridge" ]; then
-    if ! systemctl --user is-active --quiet citrix-clip-bridge.service 2>/dev/null; then
-        setsid env -u GTK_PATH -u GTK_EXE_PREFIX -u GTK_DATA_PREFIX -u LD_LIBRARY_PATH \
-          GDK_BACKEND=x11 DISPLAY="${DISPLAY:-:0}" \
-          WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
-          XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
-          HOME="${HOME:-}" PATH="/usr/bin:/bin" \
-          "$ICAROOT/util/citrix-clip-bridge" >/dev/null 2>&1 &
-    fi
-fi
-
-filearg=
-if [ "$#" -eq 1 ] && [ -f "$1" ]; then
-  case "$1" in
-    *.ica|*.ICA) filearg=$(readlink -f "$1") ;;
-  esac
-fi
-
-if [ -n "$filearg" ]; then
-  set -- -icaroot "$ICAROOT" -protocolfile "$PROTOCOLFILE" -clientfile "$CLIENTFILE" -file "$filearg"
-else
-  set -- -icaroot "$ICAROOT" -protocolfile "$PROTOCOLFILE" -clientfile "$CLIENTFILE" "$@"
-fi
-
-exec "$ICAROOT/wfica" "$@"
+exec /opt/Citrix/ICAClient/wfica "$@"
 EOF
   chmod 755 "$pkgdir/usr/bin/wfica"
 

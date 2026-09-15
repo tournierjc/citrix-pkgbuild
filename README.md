@@ -22,6 +22,23 @@ into `citrix/` and run `makepkg` again.
 The `wfica` wrapper always passes `-clientfile /opt/Citrix/ICAClient/config/wfclient.ini`,
 so `~/.ICAClient/wfclient.ini` is ignored for keyboard settings.
 
+## Display (single 4K) and NVIDIA decode
+
+Sessions are forced to **one 3840×2160 monitor** (`-span 1 -geometry 3840x2160+0+0`,
+`DesiredHRES`/`DesiredVRES` locked in `All_Regions.ini`). Spanning both 4K
+panels (7680×2209) is too large for VAAPI (max ~4096×4096) and falls back to
+CPU H.264.
+
+Workspace app for Linux turns off hardware decode when it sees an NVIDIA GPU.
+The package patches that check and points VAAPI at `libva-nvidia-driver`
+(`LIBVA_DRIVER_NAME=nvidia`) so NVDEC handles H.264/H.265. After a session
+starts, `journalctl --user -t citrix-wfica` should show VAAPI/hardware decode
+rather than `Hardware decoding disabled because Nvidia GPU is installed`.
+
+Reconnect the session after install. To temporarily restore vendor behaviour,
+launch with `LIBVA_DRIVER_NAME=` unset and replace `/opt/Citrix/ICAClient/wfica.real`
+from a stock RPM.
+
 ## Keyboard (nested RDP)
 
 Packaged `wfclient.ini` uses:

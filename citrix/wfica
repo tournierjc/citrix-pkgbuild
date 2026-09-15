@@ -1,0 +1,76 @@
+#!/bin/bash
+# Launch wrapper: single 3840x2160 display + NVIDIA VAAPI/NVDEC.
+ICAROOT=/opt/Citrix/ICAClient
+export ICAROOT
+export LD_LIBRARY_PATH="${ICAROOT}/lib:${ICAROOT}/Webkit2gtk4.0/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+export GTK_PATH="${ICAROOT}/gtk${GTK_PATH:+:${GTK_PATH}}"
+# nvidia-vaapi-driver → NVDEC. Citrix only talks VAAPI, not NVDEC directly.
+export LIBVA_DRIVER_NAME="${LIBVA_DRIVER_NAME:-nvidia}"
+export NVD_BACKEND="${NVD_BACKEND:-direct}"
+
+CLIENTFILE="${ICAROOT}/config/wfclient.ini"
+PROTOCOLFILE="${ICAROOT}/config/module.ini"
+REALWFICA="${ICAROOT}/wfica.real"
+SESSION_W=3840
+SESSION_H=2160
+
+if [ ! -x "$REALWFICA" ]; then
+  echo "wfica: missing $REALWFICA" >&2
+  exit 127
+fi
+
+# Clip bridge is a user systemd service. Keep a fallback start if it is not
+# running yet; do not kill a systemd-managed instance on every wfica launch.
+if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -x "$ICAROOT/util/citrix-clip-bridge" ]; then
+    if ! systemctl --user is-active --quiet citrix-clip-bridge.service 2>/dev/null; then
+        setsid env -u GTK_PATH -u GTK_EXE_PREFIX -u GTK_DATA_PREFIX -u LD_LIBRARY_PATH \
+          GDK_BACKEND=x11 DISPLAY="${DISPLAY:-:0}" \
+          WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+          XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+          HOME="${HOME:-}" PATH="/usr/bin:/bin" \
+          "$ICAROOT/util/citrix-clip-bridge" >/dev/null 2>&1 &
+    fi
+fi
+
+# Last session remembered "extend to all displays" (selection 2) → 7680x2209.
+if [ -f "${HOME}/.ICAClient/.ctxmonitorselection.json" ]; then
+  sed -i 's/"selection": *[0-9][0-9]*/"selection": 1/' \
+    "${HOME}/.ICAClient/.ctxmonitorselection.json" 2>/dev/null || true
+fi
+if [ -f "${HOME}/.ICAClient/All_Regions.ini" ]; then
+  sed -i \
+    -e 's/^DesiredHRES=.*/DesiredHRES=3840/' \
+    -e 's/^DesiredVRES=.*/DesiredVRES=2160/' \
+    "${HOME}/.ICAClient/All_Regions.ini" 2>/dev/null || true
+fi
+
+force_ica_res() {
+  _in=$1
+  _out="${XDG_RUNTIME_DIR:-/tmp}/citrix-forced.ica"
+  sed -E \
+    -e 's/^DesiredHRES=.*/DesiredHRES=3840/' \
+    -e 's/^DesiredVRES=.*/DesiredVRES=2160/' \
+    -e 's/^ScreenPercent=.*/ScreenPercent=100/' \
+    "$_in" > "$_out"
+  printf '%s\n' "$_out"
+}
+
+filearg=
+if [ "$#" -eq 1 ] && [ -f "$1" ]; then
+  case "$1" in
+    *.ica|*.ICA) filearg=$(readlink -f "$1") ;;
+  esac
+fi
+
+if [ -n "$filearg" ]; then
+  filearg=$(force_ica_res "$filearg")
+  set -- -span 1 -geometry "${SESSION_W}x${SESSION_H}+0+0" \
+    -icaroot "$ICAROOT" -protocolfile "$PROTOCOLFILE" -clientfile "$CLIENTFILE" \
+    -file "$filearg"
+else
+  set -- -span 1 -geometry "${SESSION_W}x${SESSION_H}+0+0" \
+    -icaroot "$ICAROOT" -protocolfile "$PROTOCOLFILE" -clientfile "$CLIENTFILE" \
+    "$@"
+fi
+
+exec -a wfica "$REALWFICA" "$@"
