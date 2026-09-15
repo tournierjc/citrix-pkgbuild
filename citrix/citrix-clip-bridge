@@ -80,6 +80,12 @@ libX11.XExtendedMaxRequestSize.restype = ctypes.c_long
 libX11.XExtendedMaxRequestSize.argtypes = [ctypes.c_void_p]
 libX11.XGetSelectionOwner.restype = ctypes.c_ulong
 libX11.XGetSelectionOwner.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+libX11.XSetSelectionOwner.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_ulong,
+    ctypes.c_ulong,
+    ctypes.c_ulong,
+]
 libX11.XQueryTree.restype = ctypes.c_int
 libX11.XQueryTree.argtypes = [
     ctypes.c_void_p,
@@ -120,6 +126,9 @@ last_ingest_at = 0.0
 last_export_at = 0.0
 pull_cool_until = 0.0
 session_pull_done = False
+# True after Wayland ingest until Citrix ConvertSelection's _ISL_DIB.
+pending_serve = False
+ingest_seq = 0
 atom_dib = None
 atom_isl = None
 atom_bmp = None
@@ -394,6 +403,20 @@ def x11_now() -> int:
         return 0
 
 
+def release_selections() -> None:
+    """Drop CLIPBOARD/PRIMARY so the next claim is a real owner change.
+
+    Re-calling SetSelectionOwner while we already own is a no-op on X11, so
+    wfica never ConvertSelection's a newer image. Clear first, then reclaim.
+    """
+    if x11_dpy is None:
+        return
+    t = x11_now()
+    for name in ("CLIPBOARD", "PRIMARY"):
+        libX11.XSetSelectionOwner(x11_dpy, x_atom(name), 0, t)
+    libX11.XFlush(x11_dpy)
+
+
 def offer_selections(both: bool = True) -> None:
     from gi.repository import Gtk, Gdk
 
@@ -403,6 +426,36 @@ def offer_selections(both: bool = True) -> None:
     Gtk.selection_owner_set(holder, Gdk.SELECTION_PRIMARY, t)
     if both:
         Gtk.selection_owner_set(holder, Gdk.SELECTION_CLIPBOARD, t)
+
+
+def _reclaim_after_release() -> bool:
+    if not dib_bytes:
+        return False
+    offer_selections(True)
+    log("reclaimed CLIPBOARD after release")
+    return False
+
+
+def poke_c2h_offer(seq: int, reason: str) -> bool:
+    """If Citrix still has not fetched _ISL_DIB, force a fresh owner claim."""
+    global reassert_left
+    if seq != ingest_seq or not pending_serve or not dib_bytes:
+        return False
+    from gi.repository import GLib
+
+    log(f"c2h poke ({reason})")
+    release_selections()
+    reassert_left = max(reassert_left, 4)
+    GLib.timeout_add(40, _reclaim_after_release)
+    return False
+
+
+def schedule_c2h_pokes(seq: int) -> None:
+    from gi.repository import GLib
+
+    GLib.timeout_add(200, poke_c2h_offer, seq, "200ms")
+    GLib.timeout_add(500, poke_c2h_offer, seq, "500ms")
+    GLib.timeout_add(1200, poke_c2h_offer, seq, "1200ms")
 
 
 def pixbuf_to_png(pb) -> bytes:
@@ -431,7 +484,7 @@ def wl_copy_png(png: bytes) -> None:
 def ingest_png() -> None:
     global dib_bytes, pixbuf, last_hash, reassert_left, logged_gets
     global last_ingest_at, pull_cool_until, pulled_owner_xid, wfica_pull_tries
-    global session_pull_done
+    global session_pull_done, pending_serve, ingest_seq
     try:
         png = open(PNG_PATH, "rb").read()
     except OSError:
@@ -439,7 +492,7 @@ def ingest_png() -> None:
     if not png:
         return
     digest = hashlib.sha256(png).hexdigest()
-    if digest == last_hash:
+    if digest == last_hash and not pending_serve:
         return
     if time.monotonic() - last_export_at < 3.0:
         return
@@ -458,6 +511,9 @@ def ingest_png() -> None:
         return
     if len(dib) < 40:
         return
+    from gi.repository import GLib
+
+    same = digest == last_hash
     dib_bytes = dib
     pixbuf = pb
     last_hash = digest
@@ -467,9 +523,20 @@ def ingest_png() -> None:
     pulled_owner_xid = 0
     wfica_pull_tries = 0
     session_pull_done = False
-    offer_selections(True)
-    reassert_left = 8
-    log(f"offered DIB {pb.get_width()}x{pb.get_height()} ({len(dib_bytes)} bytes)")
+    pending_serve = True
+    ingest_seq += 1
+    seq = ingest_seq
+    # Always release+reclaim: SetSelectionOwner to self is a no-op, and even a
+    # fresh claim is often ignored by wfica until a second owner-change edge.
+    reassert_left = 6
+    release_selections()
+    GLib.timeout_add(40, _reclaim_after_release)
+    log(
+        f"offered DIB {pb.get_width()}x{pb.get_height()} "
+        f"({len(dib_bytes)} bytes)"
+        + (" (same png retry)" if same else "")
+    )
+    schedule_c2h_pokes(seq)
 
 
 def publish_session_image(pb) -> None:
@@ -560,15 +627,28 @@ def send_dib_property(event, payload: bytes) -> bool:
 
 
 def on_selection_request(_widget, event) -> bool:
-    global logged_gets
+    global logged_gets, reassert_left, pending_serve
     name = _atom_name(event.target)
     if name not in logged_gets:
         logged_gets.add(name)
         log(f"selection-request {name}")
+    # Citrix ConvertSelection is in progress. Stop reclaiming CLIPBOARD or we
+    # race the C2H render and paste into the session / MSTSC fails.
+    if name in ("_ISL_DIB", "DIB", "PIXMAP", "image/bmp", "_ISL_RGBQUAD"):
+        reassert_left = 0
     if name == "_ISL_DIB" and dib_bytes:
-        return send_dib_property(event, dib_bytes)
+        ok = send_dib_property(event, dib_bytes)
+        if ok:
+            pending_serve = False
+        log(f"served _ISL_DIB {len(dib_bytes)} bytes ok={ok}")
+        return ok
     if name == "DIB" and dib_bytes:
-        return send_dib_property(event, as_cf_dib(dib_bytes))
+        payload = as_cf_dib(dib_bytes)
+        ok = send_dib_property(event, payload)
+        if ok:
+            pending_serve = False
+        log(f"served DIB {len(payload)} bytes ok={ok}")
+        return ok
     if name == "_ISL_RGBQUAD":
         return send_dib_property(event, bytes(ISL_RGBQUAD))
     if name == "image/bmp" and dib_bytes:
@@ -579,7 +659,7 @@ def on_selection_request(_widget, event) -> bool:
 
 
 def on_selection_get(_widget, selection_data, info, _time) -> None:
-    global logged_gets
+    global logged_gets, reassert_left
     target = selection_data.get_target()
     try:
         name = target.name()
@@ -589,6 +669,7 @@ def on_selection_get(_widget, selection_data, info, _time) -> None:
         logged_gets.add(name)
         log(f"selection-get {name} info={info}")
     if info == 3 and pixbuf is not None:
+        reassert_left = 0
         selection_data.set_pixbuf(pixbuf)
 
 
@@ -612,7 +693,17 @@ def on_selection_clear(_widget, event) -> bool:
     from gi.repository import Gdk, GLib
 
     if owner_is_wfica(Gdk.SELECTION_CLIPBOARD):
-        reassert_left = 0
+        # Mid-_ISL_DIB transfer: do not reclaim. Otherwise leave reclaim alone
+        # so pending_serve pokes can still fight non-fetch ownership grabs.
+        if not pending_serve:
+            reassert_left = 0
+        # After a Wayland ingest, Citrix often claims CLIPBOARD once it has
+        # ConvertSelection'd _ISL_DIB. Pulling that ownership races the C2H
+        # path and starts an empty-DIB storm.
+        if time.monotonic() - last_ingest_at < 20.0:
+            session_pull_done = True
+            log("selection-clear after Wayland ingest; skip pull")
+            return False
         session_pull_done = False
         GLib.timeout_add(300, request_wfica_image)
     return False
@@ -626,6 +717,10 @@ def on_reassert() -> bool:
 
     reassert_left -= 1
     if we_own(Gdk.SELECTION_CLIPBOARD):
+        return True
+    if owner_is_wfica(Gdk.SELECTION_CLIPBOARD) and not pending_serve:
+        # Do not steal CLIPBOARD back from Citrix after a successful serve.
+        reassert_left = 0
         return True
     offer_selections(True)
     return True
@@ -651,12 +746,16 @@ def request_wfica_image() -> bool:
     xid = selection_owner_xid("CLIPBOARD")
     if not window_is_wfica(xid):
         return False
+    # Already decided this owner has no image; wait for a new owner.
+    if xid != 0 and xid == pulled_owner_xid:
+        return False
     import_pending = True
     pull_cool_until = now + 0.8
     log(f"pull image from wfica owner 0x{xid:x}")
 
     def finish_pixbuf(pb, src: str) -> None:
         global import_pending, pulled_owner_xid, wfica_pull_tries, pull_cool_until
+        global session_pull_done
         import_pending = False
         if pb is None:
             wfica_pull_tries += 1
@@ -664,7 +763,8 @@ def request_wfica_image() -> bool:
             pull_cool_until = time.monotonic() + delay
             if wfica_pull_tries >= 3:
                 pulled_owner_xid = xid
-                log(f"pull {src} empty; backing off")
+                session_pull_done = True
+                log(f"pull {src} empty; stop until clipboard owner changes")
             else:
                 log(f"pull {src} empty; retry later")
             return
