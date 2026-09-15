@@ -1,6 +1,6 @@
 pkgname=icaclient-bin
 pkgver=26.04.10.1
-pkgrel=16
+pkgrel=17
 pkgdesc="Citrix ICA Client (repackaged vendor RPM, no compilation)"
 arch=('x86_64')
 url="https://www.citrix.com/downloads/workspace-app/linux/workspace-app-for-linux-latest.html"
@@ -147,18 +147,47 @@ EOF
       sed -i '/^\[WFClient\]/a MouseSendsControlV=False' "$root/config/wfclient.ini"
   fi
 
-  # Insert or replace a key in an INI section.
+  # Insert or replace a key in an existing INI section. Use Python so headers
+  # that contain backslashes (e.g. [Virtual Channels\Thinwire Graphics]) are
+  # not treated as regex; grep/sed previously appended duplicate empty sections
+  # and Citrix then rejected the ICA file as damaged.
   _ini_set() {
     local file=$1 section=$2 key=$3 value=$4
     [[ -f "$file" ]] || return 0
-    if ! grep -q "^\[${section}\]" "$file"; then
-      printf '\n[%s]\n' "$section" >> "$file"
-    fi
-    if grep -q "^${key} *=" "$file"; then
-      sed -i "s|^${key} *=.*|${key}=${value}|" "$file"
-    else
-      sed -i "/^\[${section}\]/a ${key}=${value}" "$file"
-    fi
+    python3 - "$file" "$section" "$key" "$value" <<'PY'
+import sys
+from pathlib import Path
+
+path, section, key, value = sys.argv[1:5]
+header = f"[{section}]"
+raw = Path(path).read_text()
+newline = "\r\n" if "\r\n" in raw else "\n"
+lines = raw.splitlines()
+idx = next((i for i, line in enumerate(lines) if line.strip() == header), None)
+if idx is None:
+    if lines and lines[-1].strip():
+        lines.append("")
+    lines.append(header)
+    idx = len(lines) - 1
+end = idx + 1
+while end < len(lines):
+    stripped = lines[end].strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        break
+    end += 1
+found = False
+for i in range(idx + 1, end):
+    line = lines[i]
+    if not line or line.lstrip().startswith(";") or "=" not in line:
+        continue
+    if line.split("=", 1)[0].strip() == key:
+        lines[i] = f"{key}={value}"
+        found = True
+        break
+if not found:
+    lines.insert(idx + 1, f"{key}={value}")
+Path(path).write_text(newline.join(lines) + newline)
+PY
   }
 
   # Pin a single 3840x2160 session. Dual 4K (7680x2209) forces CPU H.264
