@@ -1,6 +1,6 @@
 pkgname=icaclient-bin
 pkgver=26.04.10.1
-pkgrel=17
+pkgrel=18
 pkgdesc="Citrix ICA Client (repackaged vendor RPM, no compilation)"
 arch=('x86_64')
 url="https://www.citrix.com/downloads/workspace-app/linux/workspace-app-for-linux-latest.html"
@@ -190,15 +190,10 @@ Path(path).write_text(newline.join(lines) + newline)
 PY
   }
 
-  # Pin a single 3840x2160 session. Dual 4K (7680x2209) forces CPU H.264
-  # because VAAPI/NVDEC maxes out at ~4096x4096. ICA files often send
-  # DesiredHRES=4294967295 (all monitors); a single All_Regions value wins.
+  # Enable GPU decode. Do not lock DesiredHRES/VRES: that pinned every session
+  # to 3840x2160 and blocked windowed / smaller sizes.
   local ini
   for ini in "$root/config/wfclient.ini"; do
-    _ini_set "$ini" WFClient MultiMonitorSelectionEnabled False
-    _ini_set "$ini" Thinwire3.0 DesiredHRES 3840
-    _ini_set "$ini" Thinwire3.0 DesiredVRES 2160
-    _ini_set "$ini" Thinwire3.0 UseFullScreen True
     _ini_set "$ini" Thinwire3.0 OpenGLEnabled True
     _ini_set "$ini" Thinwire3.0 HWAccelerationEnabled True
     _ini_set "$ini" Thinwire3.0 H264Enabled True
@@ -206,10 +201,7 @@ PY
     _ini_set "$ini" Thinwire3.0 DirectDecode True
   done
   for ini in "$root/config/All_Regions.ini" "$root/config/All_Regions_desktoplock.ini"; do
-    _ini_set "$ini" 'Virtual Channels\Thinwire Graphics' DesiredHRES 3840
-    _ini_set "$ini" 'Virtual Channels\Thinwire Graphics' DesiredVRES 2160
     _ini_set "$ini" 'Virtual Channels\Thinwire Graphics' HWAccelerationEnabled True
-    _ini_set "$ini" 'Virtual Channels\Thinwire Graphics' MultiMonitorSelectionEnabled False
   done
 
   # Force the same keyboard defaults in appsrv.ini as well; some Citrix flows

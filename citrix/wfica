@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch wrapper: single 3840x2160 display + NVIDIA VAAPI/NVDEC.
+# Launch wrapper: NVIDIA VAAPI/NVDEC, clip bridge, packaged wfclient.ini.
 ICAROOT=/opt/Citrix/ICAClient
 export ICAROOT
 export LD_LIBRARY_PATH="${ICAROOT}/lib:${ICAROOT}/Webkit2gtk4.0/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
@@ -11,8 +11,6 @@ export NVD_BACKEND="${NVD_BACKEND:-direct}"
 CLIENTFILE="${ICAROOT}/config/wfclient.ini"
 PROTOCOLFILE="${ICAROOT}/config/module.ini"
 REALWFICA="${ICAROOT}/wfica.real"
-SESSION_W=3840
-SESSION_H=2160
 
 if [ ! -x "$REALWFICA" ]; then
   echo "wfica: missing $REALWFICA" >&2
@@ -32,29 +30,6 @@ if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -x "$ICAROOT/util/citrix-clip-bridge" ]; t
     fi
 fi
 
-# Last session remembered "extend to all displays" (selection 2) → 7680x2209.
-if [ -f "${HOME}/.ICAClient/.ctxmonitorselection.json" ]; then
-  sed -i 's/"selection": *[0-9][0-9]*/"selection": 1/' \
-    "${HOME}/.ICAClient/.ctxmonitorselection.json" 2>/dev/null || true
-fi
-if [ -f "${HOME}/.ICAClient/All_Regions.ini" ]; then
-  sed -i \
-    -e 's/^DesiredHRES=.*/DesiredHRES=3840/' \
-    -e 's/^DesiredVRES=.*/DesiredVRES=2160/' \
-    "${HOME}/.ICAClient/All_Regions.ini" 2>/dev/null || true
-fi
-
-force_ica_res() {
-  _in=$1
-  _out="${XDG_RUNTIME_DIR:-/tmp}/citrix-forced.ica"
-  sed -E \
-    -e 's/^DesiredHRES=.*/DesiredHRES=3840/' \
-    -e 's/^DesiredVRES=.*/DesiredVRES=2160/' \
-    -e 's/^ScreenPercent=.*/ScreenPercent=100/' \
-    "$_in" > "$_out"
-  printf '%s\n' "$_out"
-}
-
 filearg=
 if [ "$#" -eq 1 ] && [ -f "$1" ]; then
   case "$1" in
@@ -63,13 +38,10 @@ if [ "$#" -eq 1 ] && [ -f "$1" ]; then
 fi
 
 if [ -n "$filearg" ]; then
-  filearg=$(force_ica_res "$filearg")
-  set -- -span 1 -geometry "${SESSION_W}x${SESSION_H}+0+0" \
-    -icaroot "$ICAROOT" -protocolfile "$PROTOCOLFILE" -clientfile "$CLIENTFILE" \
+  set -- -icaroot "$ICAROOT" -protocolfile "$PROTOCOLFILE" -clientfile "$CLIENTFILE" \
     -file "$filearg"
 else
-  set -- -span 1 -geometry "${SESSION_W}x${SESSION_H}+0+0" \
-    -icaroot "$ICAROOT" -protocolfile "$PROTOCOLFILE" -clientfile "$CLIENTFILE" \
+  set -- -icaroot "$ICAROOT" -protocolfile "$PROTOCOLFILE" -clientfile "$CLIENTFILE" \
     "$@"
 fi
 
