@@ -60,7 +60,8 @@ settings).
 
 Plasma copies screenshots as Wayland `image/png`. `wfica` only imports X11
 `DIB` / `_ISL_DIB` / `PIXMAP`. The daemon
-`/opt/Citrix/ICAClient/util/citrix-clip-bridge`:
+`/opt/Citrix/ICAClient/util/clip-bridge-rs` (Rust; the Python
+`citrix-clip-bridge` is still installed as a fallback):
 
 - watches Wayland `image/png` (`wl-paste --watch`) and caches a Citrix DIB
 - while a session is open, owns X11 `CLIPBOARD` and offers `_ISL_DIB`
@@ -69,9 +70,9 @@ Plasma copies screenshots as Wayland `image/png`. `wfica` only imports X11
 - does not take `PRIMARY` (Linux middle-click)
 - pulls `_ISL_DIB` from `wfica` when you copy in the session and publishes
   `image/png` with `wl-copy`
-- refuses images above the X11 BIG-REQUESTS limit (~16 MB, e.g. a
-  full-screen 4K capture) with a log line, instead of dying in Xlib's
-  default error handler
+- downscales images above the X11 BIG-REQUESTS limit (~16 MB, e.g. a
+  full-screen 4K capture becomes ~2730x1535) so the paste still works;
+  wfica cannot reassemble INCR chunks, so chunking is not an option
 
 It is a **user systemd service** and starts with the graphical session, but
 it stays idle until a `wfica` process is running. Copy/paste on the host is
@@ -79,7 +80,7 @@ left alone when Citrix is closed.
 
 ```bash
 systemctl --user status citrix-clip-bridge.service
-journalctl --user -t citrix-clip-bridge -f
+journalctl --user -t citrix-clip-bridge-rs -f
 ```
 
 The unit is enabled by the package

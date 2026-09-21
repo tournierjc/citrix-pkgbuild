@@ -19,14 +19,14 @@ fi
 
 # Clip bridge is a user systemd service. Keep a fallback start if it is not
 # running yet; do not kill a systemd-managed instance on every wfica launch.
-if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -x "$ICAROOT/util/citrix-clip-bridge" ]; then
+if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -x "$ICAROOT/util/clip-bridge-rs" ]; then
     if ! systemctl --user is-active --quiet citrix-clip-bridge.service 2>/dev/null; then
         setsid env -u GTK_PATH -u GTK_EXE_PREFIX -u GTK_DATA_PREFIX -u LD_LIBRARY_PATH \
-          GDK_BACKEND=x11 DISPLAY="${DISPLAY:-:0}" \
+          DISPLAY="${DISPLAY:-:0}" \
           WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
           XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
           HOME="${HOME:-}" PATH="/usr/bin:/bin" \
-          "$ICAROOT/util/citrix-clip-bridge" >/dev/null 2>&1 &
+          "$ICAROOT/util/clip-bridge-rs" >/dev/null 2>&1 &
     fi
 fi
 
