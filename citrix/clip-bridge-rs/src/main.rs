@@ -472,7 +472,9 @@ impl Bridge {
             .unwrap_or_else(|| format!("atom-{atom}"))
     }
 
-    fn answer(&self, ev: &SelectionRequestEvent, prop: Atom, type_: Atom, data: &[u8], format: u8) {
+    /// Answers a selection request; returns true when the data was actually
+    /// delivered, false when refused (oversize or ChangeProperty failure).
+    fn answer(&self, ev: &SelectionRequestEvent, prop: Atom, type_: Atom, data: &[u8], format: u8) -> bool {
         if data.len() > self.max_prop {
             // Over BIG-REQUESTS (a 4K screenshot is ~33 MB). wfica reassembles
             // INCR chunks incorrectly, so refuse outright instead of letting
@@ -484,7 +486,7 @@ impl Bridge {
                 self.max_prop
             ));
             self.refuse(ev);
-            return;
+            return false;
         }
         let units = (data.len() / (format as usize / 8)) as u32;
         if let Err(e) = self.conn.change_property(
@@ -498,7 +500,7 @@ impl Bridge {
         ) {
             log(&format!("ChangeProperty failed: {e}"));
             self.refuse(ev);
-            return;
+            return false;
         }
         let notify = SelectionNotifyEvent {
             response_type: SELECTION_NOTIFY_EVENT,
@@ -513,6 +515,7 @@ impl Bridge {
             .conn
             .send_event(false, ev.requestor, EventMask::NO_EVENT, notify);
         let _ = self.conn.flush();
+        true
     }
 
     fn refuse(&self, ev: &SelectionRequestEvent) {
@@ -579,9 +582,10 @@ impl Bridge {
                 self.refuse(&ev);
             } else {
                 let n = self.dib.len();
-                self.answer(&ev, prop, t, &self.dib, 8);
-                self.pending_serve = false;
-                log(&format!("served _ISL_DIB {n} bytes"));
+                if self.answer(&ev, prop, t, &self.dib, 8) {
+                    self.pending_serve = false;
+                    log(&format!("served _ISL_DIB {n} bytes"));
+                }
             }
             return;
         }
@@ -591,9 +595,10 @@ impl Bridge {
             } else {
                 let payload = dib::as_cf_dib(&self.dib);
                 let n = payload.len();
-                self.answer(&ev, prop, t, &payload, 8);
-                self.pending_serve = false;
-                log(&format!("served DIB {n} bytes"));
+                if self.answer(&ev, prop, t, &payload, 8) {
+                    self.pending_serve = false;
+                    log(&format!("served DIB {n} bytes"));
+                }
             }
             return;
         }
