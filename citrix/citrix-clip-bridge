@@ -19,6 +19,7 @@ import ctypes
 import fcntl
 import hashlib
 import os
+import shutil
 import signal
 import stat
 import struct
@@ -47,6 +48,14 @@ if _ldlp:
     else:
         os.environ.pop("LD_LIBRARY_PATH", None)
 
+
+syslog.openlog("citrix-clip-bridge", syslog.LOG_PID, syslog.LOG_USER)
+
+# Resolve our own path now: daemonize() chdirs to /, which would break
+# os.path.abspath(sys.argv[0]) for the wl-paste --watch re-exec.
+SCRIPT_PATH = os.path.realpath(sys.argv[0])
+if not os.path.isfile(SCRIPT_PATH):
+    SCRIPT_PATH = shutil.which(sys.argv[0]) or SCRIPT_PATH
 
 RUNDIR = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
 LOCK_PATH = os.path.join(RUNDIR, "citrix-clip-bridge.lock")
@@ -96,6 +105,42 @@ libX11.XQueryTree.argtypes = [
     ctypes.POINTER(ctypes.c_uint),
 ]
 libX11.XFree.argtypes = [ctypes.c_void_p]
+libX11.XMaxRequestSize.restype = ctypes.c_long
+libX11.XMaxRequestSize.argtypes = [ctypes.c_void_p]
+
+
+class _XErrorEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("serial", ctypes.c_ulong),
+        ("error_code", ctypes.c_ubyte),
+        ("request_code", ctypes.c_ubyte),
+        ("minor_code", ctypes.c_ubyte),
+        ("resourceid", ctypes.c_ulong),
+    ]
+
+
+def _x_error_log(_dpy, ev) -> int:
+    # Xlib's default error handler prints and exits, killing the bridge on
+    # any bad request (e.g. an oversize ChangeProperty). Log and continue.
+    try:
+        err = ctypes.cast(ev, ctypes.POINTER(_XErrorEvent)).contents
+        log(
+            f"X11 error {err.error_code} request {err.request_code}.{err.minor_code} "
+            f"resource 0x{err.resourceid:x}"
+        )
+    except Exception:
+        pass
+    return 0
+
+
+_XErrorHandlerFn = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+libX11.XSetErrorHandler.restype = None
+libX11.XSetErrorHandler.argtypes = [_XErrorHandlerFn]
+# Keep a reference so the callback is never garbage collected.
+_x_error_handler = _XErrorHandlerFn(_x_error_log)
+libX11.XSetErrorHandler(_x_error_handler)
 
 
 class _XClassHint(ctypes.Structure):
@@ -134,6 +179,7 @@ ingest_seq = 0
 # clipboard (and storms release/reclaim when Citrix never fetches).
 session_active = False
 wfica_focused = False
+x11_broken = False
 _wfica_cache = (0.0, False)
 _focus_cache = (0.0, False)
 png_bytes = b""
@@ -209,14 +255,10 @@ def pixbuf_to_dib(pb) -> bytes:
     for y in range(h):
         src = (h - 1 - y) * rs
         dst = ISL_PIXELS + y * stride
-        sx = src
-        dx = dst
-        for _x in range(w):
-            out[dx] = pixels[sx + 2]
-            out[dx + 1] = pixels[sx + 1]
-            out[dx + 2] = pixels[sx]
-            sx += nch
-            dx += 4
+        row = pixels[src : src + w * nch]
+        out[dst : dst + stride : 4] = row[2::nch]
+        out[dst + 1 : dst + stride : 4] = row[1::nch]
+        out[dst + 2 : dst + stride : 4] = row[0::nch]
     return bytes(out)
 
 
@@ -254,14 +296,10 @@ def isl_dib_to_pixbuf(data: bytes):
         src_y = y if top_down else (h_abs - 1 - y)
         sbase = pix_off + src_y * stride
         dbase = y * drs
-        sx = sbase
-        dx = dbase
-        for _x in range(w):
-            dest[dx] = data[sx + 2]
-            dest[dx + 1] = data[sx + 1]
-            dest[dx + 2] = data[sx]
-            sx += src_bpp
-            dx += 3
+        row = data[sbase : sbase + w * src_bpp]
+        dest[dbase : dbase + w * 3 : 3] = row[2::src_bpp]
+        dest[dbase + 1 : dbase + w * 3 : 3] = row[1::src_bpp]
+        dest[dbase + 2 : dbase + w * 3 : 3] = row[0::src_bpp]
     packed = GdkPixbuf.Pixbuf.new_from_data(
         bytes(dest),
         GdkPixbuf.Colorspace.RGB,
@@ -444,7 +482,7 @@ def wfica_is_focused() -> bool:
                 xid = part
         if xid:
             focused = window_is_wfica(int(xid, 16))
-    except (Exception, ValueError):
+    except Exception:
         focused = False
     _focus_cache = (now, focused)
     return focused
@@ -620,7 +658,8 @@ def ingest_png() -> None:
     global last_ingest_at, pull_cool_until, pulled_owner_xid, wfica_pull_tries
     global session_pull_done, pending_serve, ingest_seq
     try:
-        png = open(PNG_PATH, "rb").read()
+        with open(PNG_PATH, "rb") as fh:
+            png = fh.read()
     except OSError:
         return
     if not png:
@@ -726,6 +765,66 @@ def _atom_name(atom) -> str:
         return ""
 
 
+SELECTION_NOTIFY = 31
+
+
+class _XSelectionEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("requestor", ctypes.c_ulong),
+        ("selection", ctypes.c_ulong),
+        ("target", ctypes.c_ulong),
+        ("property", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+    ]
+
+
+class _XEvent(ctypes.Union):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("xselection", _XSelectionEvent),
+        ("pad", ctypes.c_long * 24),
+    ]
+
+
+libX11.XSendEvent.restype = ctypes.c_int
+libX11.XSendEvent.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_ulong,
+    ctypes.c_int,
+    ctypes.c_long,
+    ctypes.c_void_p,
+]
+
+
+def x11_max_property_bytes() -> int:
+    """Largest payload one ChangeProperty request can carry."""
+    if x11_dpy is None:
+        return 0
+    units = int(libX11.XExtendedMaxRequestSize(x11_dpy))
+    if units <= 0:
+        units = int(libX11.XMaxRequestSize(x11_dpy))
+    # Units are 4 bytes; leave slack for the request header.
+    return max(units * 4 - 64, 0)
+
+
+def x11_send_selection_notify(req, selection, target, prop, when) -> None:
+    """SelectionNotify straight over our connection (prop=0 is a refusal)."""
+    ev = _XEvent()
+    ev.xselection.type = SELECTION_NOTIFY
+    ev.xselection.display = x11_dpy
+    ev.xselection.requestor = req
+    ev.xselection.selection = selection
+    ev.xselection.target = target
+    ev.xselection.property = prop
+    ev.xselection.time = when
+    libX11.XSendEvent(x11_dpy, req, 0, 0, ctypes.byref(ev))
+    libX11.XFlush(x11_dpy)
+
+
 def send_dib_property(event, payload: bytes) -> bool:
     """Put the whole DIB on the requestor in one BIG-REQUESTS ChangeProperty."""
     if x11_dpy is None or not payload:
@@ -737,6 +836,17 @@ def send_dib_property(event, payload: bytes) -> bool:
         prop = target
     if req == 0 or target == 0:
         return False
+    limit = x11_max_property_bytes()
+    if limit and len(payload) > limit:
+        # Over BIG-REQUESTS (a 4K screenshot is ~33 MB). wfica reassembles
+        # INCR chunks incorrectly, so refuse outright instead of letting GTK
+        # fall back to a chunked transfer that pastes a split image.
+        log(
+            f"refused {_atom_name(event.target)}: {len(payload)} bytes "
+            f"over the X11 request limit ({limit})"
+        )
+        x11_send_selection_notify(req, _atom_x(event.selection), target, 0, int(event.time))
+        return True
     buf = ctypes.create_string_buffer(payload, len(payload))
     libX11.XChangeProperty(
         x11_dpy,
@@ -764,7 +874,8 @@ def send_dib_property(event, payload: bytes) -> bool:
 def on_selection_request(_widget, event) -> bool:
     global logged_gets, reassert_left, pending_serve
     name = _atom_name(event.target)
-    log(f"selection-request {name}")
+    if name != "TARGETS":
+        log(f"selection-request {name}")
     # Citrix ConvertSelection is in progress. Stop reclaiming CLIPBOARD or we
     # race the C2H render and paste into the session / MSTSC fails.
     if name in ("_ISL_DIB", "DIB", "CF_DIB", "PIXMAP", "image/bmp", "image/png", "_ISL_RGBQUAD"):
@@ -1029,8 +1140,16 @@ def setup_xfixes(GLib) -> None:
     xfd = libX11.XConnectionNumber(x11_dpy)
     xev = ctypes.create_string_buffer(256)
 
-    def on_x11(_fd, _cond) -> bool:
+    def on_x11(_fd, cond) -> bool:
         global last_clip_owner, pulled_owner_xid, wfica_pull_tries, session_pull_done
+        global x11_broken
+        if cond & (GLib.IOCondition.HUP | GLib.IOCondition.ERR):
+            log("X11 connection dropped; exiting so the user unit restarts us")
+            x11_broken = True
+            from gi.repository import Gtk
+
+            Gtk.main_quit()
+            return False
         saw = False
         while libX11.XPending(x11_dpy):
             libX11.XNextEvent(x11_dpy, xev)
@@ -1054,7 +1173,12 @@ def setup_xfixes(GLib) -> None:
         request_wfica_image()
         return True
 
-    GLib.unix_fd_add_full(GLib.PRIORITY_DEFAULT, xfd, GLib.IOCondition.IN, on_x11)
+    GLib.unix_fd_add_full(
+        GLib.PRIORITY_DEFAULT,
+        xfd,
+        GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR,
+        on_x11,
+    )
     log(f"XFixes selection notify on fd {xfd}")
 
 
@@ -1076,7 +1200,8 @@ def ingest_mode() -> int:
     if not png:
         return 0
     try:
-        with open(PNG_PATH, "wb") as fh:
+        fd = os.open(PNG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as fh:
             fh.write(png)
             fh.flush()
             os.fsync(fh.fileno())
@@ -1104,10 +1229,10 @@ def daemon_mode(foreground: bool = False) -> int:
     global atom_dib, atom_isl, atom_bmp, atom_pix, atom_png, atom_rgbquad
     global atom_bmp_file, atom_png_fmt, atom_cf_dib
 
-    if not os.environ.get("WAYLAND_DISPLAY"):
-        return 1 if foreground else 0
-    if not os.environ.get("DISPLAY"):
-        return 1 if foreground else 0
+    if not os.environ.get("WAYLAND_DISPLAY") or not os.environ.get("DISPLAY"):
+        # Pure X11 (or headless) session: nothing to bridge. Exit 0 so the
+        # user unit (Restart=on-failure) does not loop on X11 desktops.
+        return 0
 
     if not foreground:
         daemonize()
@@ -1128,7 +1253,6 @@ def daemon_mode(foreground: bool = False) -> int:
     gi.require_version("Gdk", "3.0")
     from gi.repository import Gtk, Gdk, GLib
 
-    syslog.openlog("citrix-clip-bridge")
     ext = libX11.XExtendedMaxRequestSize(x11_dpy)
     log(f"X11 BIG-REQUESTS max {int(ext) * 4} bytes")
 
@@ -1194,7 +1318,7 @@ def daemon_mode(foreground: bool = False) -> int:
             "image/png",
             "--watch",
             sys.executable,
-            os.path.abspath(sys.argv[0]),
+            SCRIPT_PATH,
             "--ingest",
         ],
         start_new_session=True,
@@ -1206,6 +1330,7 @@ def daemon_mode(foreground: bool = False) -> int:
     def on_exit(_signum=None, _frame=None) -> None:
         try:
             watch.terminate()
+            watch.wait(timeout=2)
         except Exception:
             pass
         try:
@@ -1220,7 +1345,12 @@ def daemon_mode(foreground: bool = False) -> int:
     if not session_active:
         log("idle until a Citrix session starts")
     Gtk.main()
-    return 0
+    try:
+        watch.terminate()
+        watch.wait(timeout=2)
+    except Exception:
+        pass
+    return 1 if x11_broken else 0
 
 
 def main() -> int:

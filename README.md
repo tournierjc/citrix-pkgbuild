@@ -69,6 +69,9 @@ Plasma copies screenshots as Wayland `image/png`. `wfica` only imports X11
 - does not take `PRIMARY` (Linux middle-click)
 - pulls `_ISL_DIB` from `wfica` when you copy in the session and publishes
   `image/png` with `wl-copy`
+- refuses images above the X11 BIG-REQUESTS limit (~16 MB, e.g. a
+  full-screen 4K capture) with a log line, instead of dying in Xlib's
+  default error handler
 
 It is a **user systemd service** and starts with the graphical session, but
 it stays idle until a `wfica` process is running. Copy/paste on the host is
