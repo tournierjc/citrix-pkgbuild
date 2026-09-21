@@ -1,7 +1,8 @@
-src/
-pkg/
+/citrix/src/
+/citrix/pkg/
 *.pkg.tar.*
 *.rpm
 *.log
 __pycache__/
 *.pyc
+target/
