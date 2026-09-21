@@ -1132,6 +1132,21 @@ fn ingest_mode() -> i32 {
     0
 }
 
+/// Drain every event x11rb already holds. This must run unconditionally, not
+/// only when poll() reports the fd readable: blocking round trips
+/// (get_property, query_tree, ...) read from the socket and can pull events
+/// into x11rb's internal buffer, after which the raw fd no longer signals
+/// POLLIN for them.
+fn drain_events(br: &mut Bridge) -> Result<(), String> {
+    loop {
+        match br.conn.poll_for_event() {
+            Ok(Some(ev)) => br.handle_event(ev),
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(format!("{e}")),
+        }
+    }
+}
+
 fn run_loop(br: &mut Bridge, notify_fd: RawFd) -> i32 {
     let xfd = br.conn.stream().as_raw_fd();
     let mut next_reassert = Instant::now();
@@ -1141,6 +1156,12 @@ fn run_loop(br: &mut Bridge, notify_fd: RawFd) -> i32 {
     loop {
         if QUIT.load(Ordering::Relaxed) {
             return 0;
+        }
+        // Drain before polling: timer handlers below do blocking round trips
+        // that may have swallowed events into x11rb's buffer.
+        if let Err(e) = drain_events(br) {
+            log(&format!("X11 poll failed: {e}"));
+            return 1;
         }
         let mut pfds = [
             libc::pollfd {
@@ -1163,15 +1184,9 @@ fn run_loop(br: &mut Bridge, notify_fd: RawFd) -> i32 {
             return 1;
         }
         if pfds[0].revents & libc::POLLIN != 0 {
-            loop {
-                match br.conn.poll_for_event() {
-                    Ok(Some(ev)) => br.handle_event(ev),
-                    Ok(None) => break,
-                    Err(e) => {
-                        log(&format!("X11 poll failed: {e}"));
-                        return 1;
-                    }
-                }
+            if let Err(e) = drain_events(br) {
+                log(&format!("X11 poll failed: {e}"));
+                return 1;
             }
         }
         if pfds[1].revents & libc::POLLIN != 0 {
@@ -1209,8 +1224,12 @@ fn run_loop(br: &mut Bridge, notify_fd: RawFd) -> i32 {
             br.poll_focus();
         }
         if br.pull.as_ref().is_some_and(|p| now >= p.deadline) {
-            br.pull = None;
+            log("pull timed out");
+            let pull = br.pull.take().expect("checked above");
             br.import_pending = false;
+            // Count as a failed try so the retry backoff (and eventual stop)
+            // applies even when the owner never answers.
+            br.pull_done(pull, None);
         }
     }
 }
