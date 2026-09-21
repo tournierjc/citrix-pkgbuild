@@ -73,9 +73,45 @@ pub fn isl_dib_to_rgb(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     Some((rgb, w as u32, h_abs as u32))
 }
 
+/// Bilinear-downscale an RGB8 buffer so the resulting _ISL_DIB fits into
+/// `max_bytes` (the X11 BIG-REQUESTS request limit). Returns the input
+/// unchanged when it already fits.
+pub fn downscale_to_fit(rgb: &[u8], w: u32, h: u32, max_bytes: usize) -> (Vec<u8>, u32, u32) {
+    let max_pixels = max_bytes.saturating_sub(ISL_PIXELS) / 4;
+    let (w, h) = (w as usize, h as usize);
+    if w == 0 || h == 0 || w * h <= max_pixels {
+        return (rgb.to_vec(), w as u32, h as u32);
+    }
+    let scale = (max_pixels as f64 / (w * h) as f64).sqrt();
+    let nw = ((w as f64 * scale).floor() as usize).max(1);
+    let nh = ((h as f64 * scale).floor() as usize).max(1);
+    let mut out = vec![0u8; nw * nh * 3];
+    for y in 0..nh {
+        let sy = ((y as f64 + 0.5) / scale - 0.5).clamp(0.0, (h - 1) as f64);
+        let y0 = sy.floor() as usize;
+        let y1 = (y0 + 1).min(h - 1);
+        let fy = sy - y0 as f64;
+        for x in 0..nw {
+            let sx = ((x as f64 + 0.5) / scale - 0.5).clamp(0.0, (w - 1) as f64);
+            let x0 = sx.floor() as usize;
+            let x1 = (x0 + 1).min(w - 1);
+            let fx = sx - x0 as f64;
+            for c in 0..3 {
+                let p00 = rgb[(y0 * w + x0) * 3 + c] as f64;
+                let p01 = rgb[(y0 * w + x1) * 3 + c] as f64;
+                let p10 = rgb[(y1 * w + x0) * 3 + c] as f64;
+                let p11 = rgb[(y1 * w + x1) * 3 + c] as f64;
+                let top = p00 + (p01 - p00) * fx;
+                let bot = p10 + (p11 - p10) * fx;
+                out[(y * nw + x) * 3 + c] = (top + (bot - top) * fy).round() as u8;
+            }
+        }
+    }
+    (out, nw as u32, nh as u32)
+}
+
 /// CF_DIB layout: BITMAPINFOHEADER followed directly by pixels (no RGBQUAD slot).
-pub fn as_cf_dib(isl: &[u8]) -> Vec<u8> {
-    if isl.len() < ISL_PIXELS {
+pub fn as_cf_dib(isl: &[u8]) -> Vec<u8> {    if isl.len() < ISL_PIXELS {
         return isl.to_vec();
     }
     let mut out = Vec::with_capacity(40 + isl.len() - ISL_PIXELS);
@@ -204,6 +240,26 @@ mod tests {
         let (back, bw, bh) = png_decode(&png).expect("decode");
         assert_eq!((bw, bh), (w, h));
         assert_eq!(back, rgb);
+    }
+
+    #[test]
+    fn downscale_fits_limit() {
+        // 4K RGB frame, X11-ish limit of 16_777_148 bytes.
+        let (w, h) = (3840u32, 2160u32);
+        let rgb = vec![128u8; (w * h * 3) as usize];
+        let max = 16_777_148usize;
+        let (out, nw, nh) = downscale_to_fit(&rgb, w, h, max);
+        assert!((nw, nh) != (w, h));
+        assert!(ISL_PIXELS + (nw * nh * 4) as usize <= max);
+        // aspect ratio roughly preserved
+        let ar_in = w as f64 / h as f64;
+        let ar_out = nw as f64 / nh as f64;
+        assert!((ar_in - ar_out).abs() < 0.01);
+        // small images pass through untouched
+        let small = vec![1u8; 4 * 4 * 3];
+        let (s, sw, sh) = downscale_to_fit(&small, 4, 4, max);
+        assert_eq!((sw, sh), (4, 4));
+        assert_eq!(s, small);
     }
 
     #[test]

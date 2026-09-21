@@ -920,6 +920,17 @@ impl Bridge {
             log("png to DIB failed: decode error");
             return;
         };
+        // A 4K screenshot is ~33 MB as a DIB, over the X11 request limit;
+        // shrink it instead of refusing every serve.
+        let (rgb, w, h) = match dib::downscale_to_fit(&rgb, w, h, self.max_prop) {
+            (r, nw, nh) if (nw, nh) != (w, h) => {
+                log(&format!(
+                    "downscaled {w}x{h} -> {nw}x{nh} to fit the X11 request limit"
+                ));
+                (r, nw, nh)
+            }
+            same => same,
+        };
         self.dib = dib::rgb_to_isl_dib(&rgb, w, h);
         self.png = png;
         self.img_w = w;
