@@ -62,13 +62,17 @@ Plasma copies screenshots as Wayland `image/png`. `wfica` only imports X11
 `DIB` / `_ISL_DIB` / `PIXMAP`. The daemon
 `/opt/Citrix/ICAClient/util/citrix-clip-bridge`:
 
-- watches Wayland `image/png` (`wl-paste --watch`)
-- offers Citrix `_ISL_DIB` (32bpp, pixels at offset `0x428`, one-shot
-  `XChangeProperty` with BIG-REQUESTS so GTK INCR cannot split the bitmap)
+- watches Wayland `image/png` (`wl-paste --watch`) and caches a Citrix DIB
+- while a session is open, owns X11 `CLIPBOARD` and offers `_ISL_DIB`
+  (32bpp, pixels at offset `0x428`, one-shot `XChangeProperty` with
+  BIG-REQUESTS) plus `image/png`, so pasting works in both Citrix and Linux
+- does not take `PRIMARY` (Linux middle-click)
 - pulls `_ISL_DIB` from `wfica` when you copy in the session and publishes
   `image/png` with `wl-copy`
 
-It is a **user systemd service** and starts with the graphical session:
+It is a **user systemd service** and starts with the graphical session, but
+it stays idle until a `wfica` process is running. Copy/paste on the host is
+left alone when Citrix is closed.
 
 ```bash
 systemctl --user status citrix-clip-bridge.service
@@ -77,7 +81,7 @@ journalctl --user -t citrix-clip-bridge -f
 
 The unit is enabled by the package
 (`graphical-session.target.wants`). After a reboot it comes up with Plasma;
-you do not need to launch Citrix first. `Restart=on-failure` brings it back
+bridging begins when you launch Citrix. `Restart=on-failure` brings it back
 if it crashes.
 
 The `wfica` wrapper starts the same binary only if the systemd unit is not

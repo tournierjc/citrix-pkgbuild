@@ -129,10 +129,22 @@ session_pull_done = False
 # True after Wayland ingest until Citrix ConvertSelection's _ISL_DIB.
 pending_serve = False
 ingest_seq = 0
+# Stay off CLIPBOARD/PRIMARY unless at least one wfica is running. The
+# user unit starts with Plasma; without this gate it steals the host
+# clipboard (and storms release/reclaim when Citrix never fetches).
+session_active = False
+wfica_focused = False
+_wfica_cache = (0.0, False)
+_focus_cache = (0.0, False)
+png_bytes = b""
 atom_dib = None
 atom_isl = None
 atom_bmp = None
 atom_pix = None
+atom_png = None
+atom_bmp_file = None
+atom_png_fmt = None
+atom_cf_dib = None
 atom_rgbquad = None
 xa_clipboard = 0
 
@@ -349,7 +361,76 @@ def holder_xid() -> int:
         return 0
 
 
+def wfica_running() -> bool:
+    """True while at least one ICA session process exists."""
+    global _wfica_cache
+    now = time.monotonic()
+    ts, cached = _wfica_cache
+    if now - ts < 0.4:
+        return cached
+    alive = False
+    try:
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{name}/cmdline", "rb") as fh:
+                    cmd = fh.read()
+            except OSError:
+                continue
+            if b"citrix-clip-bridge" in cmd:
+                continue
+            if b"/opt/Citrix/ICAClient/wfica" in cmd:
+                alive = True
+                break
+    except OSError:
+        alive = False
+    _wfica_cache = (now, alive)
+    return alive
+
+
+def drop_clipboard_ownership() -> None:
+    """Give CLIPBOARD/PRIMARY back so Linux copy/paste is untouched."""
+    global reassert_left, pending_serve, dib_bytes, pixbuf, png_bytes, ingest_seq
+    reassert_left = 0
+    pending_serve = False
+    ingest_seq += 1
+    dib_bytes = b""
+    pixbuf = None
+    png_bytes = b""
+    release_selections()
+
+
+def set_session_active(active: bool, reason: str) -> None:
+    global session_active, session_pull_done
+    if active == session_active:
+        return
+    session_active = active
+    if active:
+        session_pull_done = False
+        log(f"Citrix session detected; bridging clipboard ({reason})")
+        from gi.repository import GLib
+
+        GLib.timeout_add(400, request_wfica_image)
+        return
+    session_pull_done = True
+    drop_clipboard_ownership()
+    log(f"no Citrix session; left host clipboard alone ({reason})")
+
+
+def poll_session() -> bool:
+    set_session_active(wfica_running(), "poll")
+    return True
+
+
 def wfica_is_focused() -> bool:
+    """True only while a Citrix window is the active X11 client."""
+    global _focus_cache
+    now = time.monotonic()
+    ts, cached = _focus_cache
+    if now - ts < 0.2:
+        return cached
+    focused = False
     try:
         r = subprocess.run(
             ["xprop", "-root", "_NET_ACTIVE_WINDOW"],
@@ -357,18 +438,42 @@ def wfica_is_focused() -> bool:
             text=True,
             timeout=0.4,
         )
-    except Exception:
-        return False
-    xid = None
-    for part in r.stdout.replace(",", " ").split():
-        if part.startswith("0x"):
-            xid = part
-    if not xid:
-        return False
-    try:
-        return window_is_wfica(int(xid, 16))
-    except ValueError:
-        return False
+        xid = None
+        for part in r.stdout.replace(",", " ").split():
+            if part.startswith("0x"):
+                xid = part
+        if xid:
+            focused = window_is_wfica(int(xid, 16))
+    except (Exception, ValueError):
+        focused = False
+    _focus_cache = (now, focused)
+    return focused
+
+
+def citrix_is_target() -> bool:
+    """Own X11 CLIPBOARD whenever a session is open.
+
+    We advertise image/png too, so Linux paste still works; wfica picks
+    _ISL_DIB. Focus polling is unreliable and left the DIB cached but never
+    offered.
+    """
+    return session_active
+
+
+def poll_focus() -> bool:
+    """Offer the cached DIB as soon as a session exists."""
+    global wfica_focused
+    if not session_active:
+        wfica_focused = False
+        return True
+    focused = wfica_is_focused()
+    if focused == wfica_focused:
+        return True
+    wfica_focused = focused
+    log("wfica focused" if focused else "wfica unfocused")
+    if focused and dib_bytes:
+        claim_for_citrix("focus")
+    return True
 
 
 def owner_is_wfica(selection) -> bool:
@@ -408,30 +513,36 @@ def release_selections() -> None:
 
     Re-calling SetSelectionOwner while we already own is a no-op on X11, so
     wfica never ConvertSelection's a newer image. Clear first, then reclaim.
+    Only clear selections we own; SetSelectionOwner(None) as a third party
+    can unown the host clipboard.
     """
     if x11_dpy is None:
         return
+    hid = holder_xid()
+    if hid == 0:
+        return
     t = x11_now()
     for name in ("CLIPBOARD", "PRIMARY"):
+        if selection_owner_xid(name) != hid:
+            continue
         libX11.XSetSelectionOwner(x11_dpy, x_atom(name), 0, t)
     libX11.XFlush(x11_dpy)
 
 
-def offer_selections(both: bool = True) -> None:
+def offer_selections(_both: bool = True) -> None:
     from gi.repository import Gtk, Gdk
 
-    if holder is None or not dib_bytes:
+    # Never take PRIMARY: that is Linux middle-click / selection paste.
+    if not citrix_is_target() or holder is None or not dib_bytes:
         return
     t = x11_now() or Gdk.CURRENT_TIME
-    Gtk.selection_owner_set(holder, Gdk.SELECTION_PRIMARY, t)
-    if both:
-        Gtk.selection_owner_set(holder, Gdk.SELECTION_CLIPBOARD, t)
+    Gtk.selection_owner_set(holder, Gdk.SELECTION_CLIPBOARD, t)
 
 
 def _reclaim_after_release() -> bool:
-    if not dib_bytes:
+    if not citrix_is_target() or not dib_bytes:
         return False
-    offer_selections(True)
+    offer_selections()
     log("reclaimed CLIPBOARD after release")
     return False
 
@@ -439,7 +550,12 @@ def _reclaim_after_release() -> bool:
 def poke_c2h_offer(seq: int, reason: str) -> bool:
     """If Citrix still has not fetched _ISL_DIB, force a fresh owner claim."""
     global reassert_left
-    if seq != ingest_seq or not pending_serve or not dib_bytes:
+    if (
+        not citrix_is_target()
+        or seq != ingest_seq
+        or not pending_serve
+        or not dib_bytes
+    ):
         return False
     from gi.repository import GLib
 
@@ -448,6 +564,24 @@ def poke_c2h_offer(seq: int, reason: str) -> bool:
     reassert_left = max(reassert_left, 4)
     GLib.timeout_add(40, _reclaim_after_release)
     return False
+
+
+def claim_for_citrix(reason: str) -> None:
+    """Take CLIPBOARD so wfica can ConvertSelection _ISL_DIB."""
+    global reassert_left, ingest_seq, pending_serve
+    if not citrix_is_target() or not dib_bytes:
+        return
+    from gi.repository import GLib
+
+    pending_serve = True
+    ingest_seq += 1
+    seq = ingest_seq
+    reassert_left = 6
+    release_selections()
+    GLib.timeout_add(40, _reclaim_after_release)
+    schedule_c2h_pokes(seq)
+    size = f"{pixbuf.get_width()}x{pixbuf.get_height()} " if pixbuf is not None else ""
+    log(f"offered DIB {size}({len(dib_bytes)} bytes) ({reason})")
 
 
 def schedule_c2h_pokes(seq: int) -> None:
@@ -482,7 +616,7 @@ def wl_copy_png(png: bytes) -> None:
 
 
 def ingest_png() -> None:
-    global dib_bytes, pixbuf, last_hash, reassert_left, logged_gets
+    global dib_bytes, pixbuf, png_bytes, last_hash, reassert_left, logged_gets
     global last_ingest_at, pull_cool_until, pulled_owner_xid, wfica_pull_tries
     global session_pull_done, pending_serve, ingest_seq
     try:
@@ -491,8 +625,14 @@ def ingest_png() -> None:
         return
     if not png:
         return
+    if not wfica_running():
+        set_session_active(False, "ingest")
+        return
+    set_session_active(True, "ingest")
     digest = hashlib.sha256(png).hexdigest()
-    if digest == last_hash and not pending_serve:
+    # Same-png retries while pending_serve raced KWin and stole CLIPBOARD
+    # even with no Citrix session. c2h pokes already re-claim if needed.
+    if digest == last_hash:
         return
     if time.monotonic() - last_export_at < 3.0:
         return
@@ -511,11 +651,10 @@ def ingest_png() -> None:
         return
     if len(dib) < 40:
         return
-    from gi.repository import GLib
 
-    same = digest == last_hash
     dib_bytes = dib
     pixbuf = pb
+    png_bytes = png
     last_hash = digest
     logged_gets = set()
     last_ingest_at = time.monotonic()
@@ -525,18 +664,14 @@ def ingest_png() -> None:
     session_pull_done = False
     pending_serve = True
     ingest_seq += 1
-    seq = ingest_seq
-    # Always release+reclaim: SetSelectionOwner to self is a no-op, and even a
-    # fresh claim is often ignored by wfica until a second owner-change edge.
-    reassert_left = 6
-    release_selections()
-    GLib.timeout_add(40, _reclaim_after_release)
+    if citrix_is_target():
+        claim_for_citrix("ingest")
+        return
+    reassert_left = 0
     log(
-        f"offered DIB {pb.get_width()}x{pb.get_height()} "
-        f"({len(dib_bytes)} bytes)"
-        + (" (same png retry)" if same else "")
+        f"cached DIB {pb.get_width()}x{pb.get_height()} "
+        f"({len(dib_bytes)} bytes); waiting for a Citrix session"
     )
-    schedule_c2h_pokes(seq)
 
 
 def publish_session_image(pb) -> None:
@@ -629,20 +764,20 @@ def send_dib_property(event, payload: bytes) -> bool:
 def on_selection_request(_widget, event) -> bool:
     global logged_gets, reassert_left, pending_serve
     name = _atom_name(event.target)
-    if name not in logged_gets:
-        logged_gets.add(name)
-        log(f"selection-request {name}")
+    log(f"selection-request {name}")
     # Citrix ConvertSelection is in progress. Stop reclaiming CLIPBOARD or we
     # race the C2H render and paste into the session / MSTSC fails.
-    if name in ("_ISL_DIB", "DIB", "PIXMAP", "image/bmp", "_ISL_RGBQUAD"):
+    if name in ("_ISL_DIB", "DIB", "CF_DIB", "PIXMAP", "image/bmp", "image/png", "_ISL_RGBQUAD"):
         reassert_left = 0
+    if name in ("image/png", "PNG") and png_bytes:
+        return send_dib_property(event, png_bytes)
     if name == "_ISL_DIB" and dib_bytes:
         ok = send_dib_property(event, dib_bytes)
         if ok:
             pending_serve = False
         log(f"served _ISL_DIB {len(dib_bytes)} bytes ok={ok}")
         return ok
-    if name == "DIB" and dib_bytes:
+    if name in ("DIB", "CF_DIB") and dib_bytes:
         payload = as_cf_dib(dib_bytes)
         ok = send_dib_property(event, payload)
         if ok:
@@ -651,7 +786,7 @@ def on_selection_request(_widget, event) -> bool:
         return ok
     if name == "_ISL_RGBQUAD":
         return send_dib_property(event, bytes(ISL_RGBQUAD))
-    if name == "image/bmp" and dib_bytes:
+    if name in ("image/bmp", "BMP") and dib_bytes:
         cf = as_cf_dib(dib_bytes)
         bmp = b"BM" + struct.pack("<IHHI", 14 + len(cf), 0, 0, 54) + cf
         return send_dib_property(event, bmp)
@@ -671,6 +806,20 @@ def on_selection_get(_widget, selection_data, info, _time) -> None:
     if info == 3 and pixbuf is not None:
         reassert_left = 0
         selection_data.set_pixbuf(pixbuf)
+    if info == 5 and png_bytes and atom_png is not None:
+        reassert_left = 0
+        selection_data.set(atom_png, 8, png_bytes)
+    if info == 6 and png_bytes and atom_png_fmt is not None:
+        reassert_left = 0
+        selection_data.set(atom_png_fmt, 8, png_bytes)
+    if info == 7 and dib_bytes and atom_bmp_file is not None:
+        reassert_left = 0
+        cf = as_cf_dib(dib_bytes)
+        bmp = b"BM" + struct.pack("<IHHI", 14 + len(cf), 0, 0, 54) + cf
+        selection_data.set(atom_bmp_file, 8, bmp)
+    if info == 8 and dib_bytes and atom_cf_dib is not None:
+        reassert_left = 0
+        selection_data.set(atom_cf_dib, 8, as_cf_dib(dib_bytes))
 
 
 def selection_bytes(sel_data) -> bytes:
@@ -687,6 +836,8 @@ def selection_bytes(sel_data) -> bytes:
 
 def on_selection_clear(_widget, event) -> bool:
     global reassert_left, session_pull_done
+    if not session_active:
+        return False
     name = _atom_name(event.selection)
     if name != "CLIPBOARD":
         return False
@@ -711,7 +862,7 @@ def on_selection_clear(_widget, event) -> bool:
 
 def on_reassert() -> bool:
     global reassert_left
-    if reassert_left <= 0 or not dib_bytes:
+    if not session_active or reassert_left <= 0 or not dib_bytes:
         return True
     from gi.repository import Gdk
 
@@ -722,7 +873,7 @@ def on_reassert() -> bool:
         # Do not steal CLIPBOARD back from Citrix after a successful serve.
         reassert_left = 0
         return True
-    offer_selections(True)
+    offer_selections()
     return True
 
 
@@ -731,7 +882,7 @@ def request_wfica_image() -> bool:
     from gi.repository import Gtk, Gdk, GLib
 
     now = time.monotonic()
-    if import_pending or holder is None:
+    if not session_active or import_pending or holder is None:
         return False
     if session_pull_done:
         return False
@@ -815,7 +966,7 @@ def request_wfica_image() -> bool:
 def poll_wfica_export() -> bool:
     from gi.repository import Gdk
 
-    if session_pull_done or reassert_left > 0:
+    if not session_active or session_pull_done or reassert_left > 0:
         return True
     if we_own(Gdk.SELECTION_CLIPBOARD):
         return True
@@ -894,7 +1045,7 @@ def setup_xfixes(GLib) -> None:
         last_clip_owner = xid
         if xid == 0 or xid == holder_xid():
             return True
-        if not window_is_wfica(xid):
+        if not session_active or not window_is_wfica(xid):
             return True
         if prev != xid:
             session_pull_done = False
@@ -919,6 +1070,8 @@ def notify_daemon() -> None:
 
 
 def ingest_mode() -> int:
+    if not wfica_running():
+        return 0
     png = sys.stdin.buffer.read()
     if not png:
         return 0
@@ -948,7 +1101,8 @@ def open_notify_fifo() -> int:
 
 def daemon_mode(foreground: bool = False) -> int:
     global holder, x11_dpy
-    global atom_dib, atom_isl, atom_bmp, atom_pix, atom_rgbquad
+    global atom_dib, atom_isl, atom_bmp, atom_pix, atom_png, atom_rgbquad
+    global atom_bmp_file, atom_png_fmt, atom_cf_dib
 
     if not os.environ.get("WAYLAND_DISPLAY"):
         return 1 if foreground else 0
@@ -985,14 +1139,21 @@ def daemon_mode(foreground: bool = False) -> int:
     atom_isl = Gdk.Atom.intern("_ISL_DIB", False)
     atom_bmp = Gdk.Atom.intern("image/bmp", False)
     atom_pix = Gdk.Atom.intern("PIXMAP", False)
+    atom_png = Gdk.Atom.intern("image/png", False)
+    atom_bmp_file = Gdk.Atom.intern("BMP", False)
+    atom_png_fmt = Gdk.Atom.intern("PNG", False)
+    atom_cf_dib = Gdk.Atom.intern("CF_DIB", False)
     atom_rgbquad = Gdk.Atom.intern("_ISL_RGBQUAD", False)
-    for sel in (Gdk.SELECTION_CLIPBOARD, Gdk.SELECTION_PRIMARY):
-        Gtk.selection_clear_targets(holder, sel)
-        Gtk.selection_add_target(holder, sel, atom_dib, 1)
-        Gtk.selection_add_target(holder, sel, atom_isl, 1)
-        Gtk.selection_add_target(holder, sel, atom_rgbquad, 4)
-        Gtk.selection_add_target(holder, sel, atom_bmp, 2)
-        Gtk.selection_add_target(holder, sel, atom_pix, 3)
+    Gtk.selection_clear_targets(holder, Gdk.SELECTION_CLIPBOARD)
+    Gtk.selection_add_target(holder, Gdk.SELECTION_CLIPBOARD, atom_dib, 1)
+    Gtk.selection_add_target(holder, Gdk.SELECTION_CLIPBOARD, atom_isl, 1)
+    Gtk.selection_add_target(holder, Gdk.SELECTION_CLIPBOARD, atom_rgbquad, 4)
+    Gtk.selection_add_target(holder, Gdk.SELECTION_CLIPBOARD, atom_bmp, 2)
+    Gtk.selection_add_target(holder, Gdk.SELECTION_CLIPBOARD, atom_pix, 3)
+    Gtk.selection_add_target(holder, Gdk.SELECTION_CLIPBOARD, atom_png, 5)
+    Gtk.selection_add_target(holder, Gdk.SELECTION_CLIPBOARD, atom_png_fmt, 6)
+    Gtk.selection_add_target(holder, Gdk.SELECTION_CLIPBOARD, atom_bmp_file, 7)
+    Gtk.selection_add_target(holder, Gdk.SELECTION_CLIPBOARD, atom_cf_dib, 8)
 
     holder.connect("selection-request-event", on_selection_request)
     holder.connect("selection-get", on_selection_get)
@@ -1014,6 +1175,10 @@ def daemon_mode(foreground: bool = False) -> int:
     )
     GLib.timeout_add(250, on_reassert)
     GLib.timeout_add(1500, poll_wfica_export)
+    GLib.timeout_add(1000, poll_session)
+    GLib.timeout_add(300, poll_focus)
+    poll_session()
+    poll_focus()
 
     os.ftruncate(lock_fd, 0)
     os.lseek(lock_fd, 0, os.SEEK_SET)
@@ -1052,6 +1217,8 @@ def daemon_mode(foreground: bool = False) -> int:
     signal.signal(signal.SIGTERM, on_exit)
     signal.signal(signal.SIGINT, on_exit)
     log("watching Wayland image/png for X11 ISL_DIB (pixels at 0x428)")
+    if not session_active:
+        log("idle until a Citrix session starts")
     Gtk.main()
     return 0
 
