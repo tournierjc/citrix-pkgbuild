@@ -10,6 +10,8 @@
 //! - the wl-paste --watch child re-execs /proc/self/exe instead of argv[0]
 //! - INCR receiving is implemented for the Citrix -> Wayland pull
 //! - PIXMAP and TIMESTAMP targets are not advertised (wfica picks _ISL_DIB)
+//! - uses XFixes/SelectionRequest timestamps (not CurrentTime) for
+//!   ConvertSelection / SetSelectionOwner; same-xid wfica re-asserts repull
 
 mod dib;
 
@@ -146,6 +148,9 @@ fn intern_atoms(conn: &RustConnection) -> Result<Atoms, Box<dyn std::error::Erro
 enum PullStage {
     Isl,
     Dib,
+    CfDib,
+    ImageBmp,
+    ImagePng,
 }
 
 struct Incr {
@@ -198,6 +203,12 @@ struct Bridge {
     last_export_at: Option<Instant>,
     pull_cool_until: Option<Instant>,
     last_clip_owner: Window,
+    /// Last non-zero X server timestamp observed (SelectionRequest / XFixes / …).
+    /// wfica is picky: ConvertSelection/SetSelectionOwner with CurrentTime often
+    /// returns property=None or never answers, while GTK's server time works.
+    last_x_time: u32,
+    /// Timestamp to stamp the in-flight ConvertSelection with.
+    pull_time: u32,
     wfica_focused: bool,
     wfica_cache: Option<(Instant, bool)>,
     focus_cache: Option<(Instant, bool)>,
@@ -220,6 +231,22 @@ impl Bridge {
 
     fn we_own(&self, sel: Atom) -> bool {
         self.selection_owner(sel) == self.holder
+    }
+
+    fn note_time(&mut self, t: u32) {
+        if t != 0 && t != CURRENT_TIME {
+            self.last_x_time = t;
+        }
+    }
+
+    fn stamp(&self) -> u32 {
+        if self.pull_time != 0 && self.pull_time != CURRENT_TIME {
+            self.pull_time
+        } else if self.last_x_time != 0 {
+            self.last_x_time
+        } else {
+            CURRENT_TIME
+        }
     }
 
     fn class_is_wfica(&self, xid: Window) -> bool {
@@ -330,9 +357,10 @@ impl Bridge {
     /// clipboard.
     fn release_selections(&self) {
         if self.selection_owner(self.atoms.clipboard) == self.holder {
+            let t = if self.last_x_time != 0 { self.last_x_time } else { CURRENT_TIME };
             let _ = self
                 .conn
-                .set_selection_owner(NONE, self.atoms.clipboard, CURRENT_TIME);
+                .set_selection_owner(NONE, self.atoms.clipboard, t);
             let _ = self.conn.flush();
         }
     }
@@ -341,9 +369,10 @@ impl Bridge {
         if !self.citrix_is_target() || self.dib.is_empty() {
             return;
         }
+        let t = if self.last_x_time != 0 { self.last_x_time } else { CURRENT_TIME };
         let _ = self
             .conn
-            .set_selection_owner(self.holder, self.atoms.clipboard, CURRENT_TIME);
+            .set_selection_owner(self.holder, self.atoms.clipboard, t);
         let _ = self.conn.flush();
     }
 
@@ -571,9 +600,13 @@ impl Bridge {
         }
         if t == a.image_png || t == a.png {
             if self.png.is_empty() {
+                log("refused image/png: empty cache");
                 self.refuse(&ev);
             } else {
-                self.answer(&ev, prop, t, &self.png, 8);
+                let n = self.png.len();
+                if self.answer(&ev, prop, t, &self.png, 8) {
+                    log(&format!("served image/png {n} bytes"));
+                }
             }
             return;
         }
@@ -653,16 +686,24 @@ impl Bridge {
         let target = match stage {
             PullStage::Isl => self.atoms.isl_dib,
             PullStage::Dib => self.atoms.dib,
+            PullStage::CfDib => self.atoms.cf_dib,
+            PullStage::ImageBmp => self.atoms.image_bmp,
+            PullStage::ImagePng => self.atoms.image_png,
         };
         self.import_pending = true;
         self.pull_cool_until = Some(Instant::now() + Duration::from_millis(800));
-        log(&format!("pull image from wfica owner 0x{owner:x} ({stage:?})"));
+        let t = self.stamp();
+        log(&format!(
+            "pull image from wfica owner 0x{owner:x} ({stage:?}) time={t}"
+        ));
+        // ICCCM: property should not already hold leftover data from a prior pull.
+        let _ = self.conn.delete_property(self.holder, self.atoms.pull_prop);
         let _ = self.conn.convert_selection(
             self.holder,
             self.atoms.clipboard,
             target,
             self.atoms.pull_prop,
-            CURRENT_TIME,
+            t,
         );
         let _ = self.conn.flush();
         self.pull = Some(Pull {
@@ -730,6 +771,10 @@ impl Bridge {
             return;
         }
         if ev.property == NONE {
+            log(&format!(
+                "pull {} refused (property NONE)",
+                self.target_name(ev.target)
+            ));
             self.pull_failed(pull);
             return;
         }
@@ -777,9 +822,25 @@ impl Bridge {
         let _ = self.conn.delete_property(self.holder, ev.property);
         let _ = self.conn.flush();
         log(&format!("pull {} {} bytes", self.target_name(ev.target), data.len()));
-        match dib::isl_dib_to_rgb(&data) {
+        let img = match pull.stage {
+            PullStage::ImagePng => dib::png_decode(&data),
+            PullStage::ImageBmp => {
+                // CF_DIB wrapped in a BMP file header (14 bytes), or raw DIB.
+                let dib_bytes = if data.len() > 14 && &data[0..2] == b"BM" {
+                    &data[14..]
+                } else {
+                    data.as_slice()
+                };
+                dib::isl_dib_to_rgb(dib_bytes)
+            }
+            _ => dib::isl_dib_to_rgb(&data),
+        };
+        match img {
             Some(img) => self.pull_done(pull, Some(img)),
-            None => self.pull_failed(pull),
+            None => {
+                log(&format!("pull {}: could not parse image", self.target_name(ev.target)));
+                self.pull_failed(pull);
+            }
         }
     }
 
@@ -833,9 +894,15 @@ impl Bridge {
     }
 
     fn pull_failed(&mut self, pull: Pull) {
-        if pull.stage == PullStage::Isl {
-            // wfica may only offer plain DIB.
-            self.start_pull(pull.owner, PullStage::Dib);
+        let next = match pull.stage {
+            PullStage::Isl => Some(PullStage::Dib),
+            PullStage::Dib => Some(PullStage::CfDib),
+            PullStage::CfDib => Some(PullStage::ImageBmp),
+            PullStage::ImageBmp => Some(PullStage::ImagePng),
+            PullStage::ImagePng => None,
+        };
+        if let Some(stage) = next {
+            self.start_pull(pull.owner, stage);
             return;
         }
         self.pull_done(pull, None);
@@ -922,6 +989,7 @@ impl Bridge {
         };
         // A 4K screenshot is ~33 MB as a DIB, over the X11 request limit;
         // shrink it instead of refusing every serve.
+        let (orig_w, orig_h) = (w, h);
         let (rgb, w, h) = match dib::downscale_to_fit(&rgb, w, h, self.max_prop) {
             (r, nw, nh) if (nw, nh) != (w, h) => {
                 log(&format!(
@@ -932,7 +1000,17 @@ impl Bridge {
             same => same,
         };
         self.dib = dib::rgb_to_isl_dib(&rgb, w, h);
-        self.png = png;
+        // Keep image/png in sync with the (possibly downscaled) DIB and under
+        // the X11 request limit. Serving the original 4K PNG while advertising
+        // it in TARGETS made selection-request image/png silently refuse.
+        self.png = if (w, h) != (orig_w, orig_h) || png.len() > self.max_prop {
+            match dib::png_encode(&rgb, w, h) {
+                Some(p) => p,
+                None => png,
+            }
+        } else {
+            png
+        };
         self.img_w = w;
         self.img_h = h;
         self.last_hash = hash;
@@ -952,11 +1030,17 @@ impl Bridge {
         if ev.selection != self.atoms.clipboard {
             return;
         }
+        self.note_time(ev.timestamp);
+        self.note_time(ev.selection_timestamp);
         let xid = ev.owner;
-        if xid == self.last_clip_owner {
+        // Destroy/close: just remember the owner is gone.
+        if ev.subtype != xfixes::SelectionEvent::SET_SELECTION_OWNER {
+            if xid == NONE {
+                self.last_clip_owner = NONE;
+            }
             return;
         }
-        let prev = self.last_clip_owner;
+        let same_owner = xid == self.last_clip_owner;
         self.last_clip_owner = xid;
         if xid == NONE || xid == self.holder {
             return;
@@ -964,20 +1048,54 @@ impl Bridge {
         if !self.session_active || !self.window_is_wfica(xid) {
             return;
         }
-        if prev != xid {
-            self.session_pull_done = false;
-            self.pulled_owner_xid = 0;
-            self.wfica_pull_tries = 0;
+        // Skip pulling back the image we just pushed into Citrix. wfica often
+        // re-claims CLIPBOARD after ConvertSelection'_ISL_DIB; treating that as
+        // a new session copy starts an empty-pull storm.
+        if self
+            .last_ingest_at
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(20))
+        {
+            if !same_owner {
+                log("xfixes after Wayland ingest; skip pull");
+            }
+            self.session_pull_done = true;
+            return;
+        }
+        // wfica keeps the same CLIPBOARD owner window across copies. Ignoring
+        // same-xid re-asserts left session_pull_done stuck after empty pulls,
+        // so later image copies from the session never reached Wayland.
+        self.session_pull_done = false;
+        self.pulled_owner_xid = 0;
+        self.wfica_pull_tries = 0;
+        self.pull_time = if ev.selection_timestamp != 0 {
+            ev.selection_timestamp
+        } else {
+            ev.timestamp
+        };
+        if same_owner {
+            log(&format!("wfica re-asserted CLIPBOARD 0x{xid:x}; repull"));
         }
         self.request_wfica_image();
     }
 
     fn handle_event(&mut self, ev: Event) {
         match ev {
-            Event::SelectionRequest(e) => self.on_selection_request(e),
-            Event::SelectionClear(e) => self.on_selection_clear(e),
-            Event::SelectionNotify(e) => self.on_selection_notify(e),
-            Event::PropertyNotify(e) => self.on_property_notify(e),
+            Event::SelectionRequest(e) => {
+                self.note_time(e.time);
+                self.on_selection_request(e);
+            }
+            Event::SelectionClear(e) => {
+                self.note_time(e.time);
+                self.on_selection_clear(e);
+            }
+            Event::SelectionNotify(e) => {
+                self.note_time(e.time);
+                self.on_selection_notify(e);
+            }
+            Event::PropertyNotify(e) => {
+                self.note_time(e.time);
+                self.on_property_notify(e);
+            }
             Event::XfixesSelectionNotify(e) => self.on_xfixes_selection(e),
             // Void requests (ChangeProperty, SetSelectionOwner, SendEvent)
             // report errors through the event stream; log instead of dying.
@@ -1384,6 +1502,8 @@ fn daemon_mode(foreground: bool) -> i32 {
         last_export_at: None,
         pull_cool_until: None,
         last_clip_owner: 0,
+        last_x_time: 0,
+        pull_time: 0,
         wfica_focused: false,
         wfica_cache: None,
         focus_cache: None,
