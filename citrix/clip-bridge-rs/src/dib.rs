@@ -111,7 +111,8 @@ pub fn downscale_to_fit(rgb: &[u8], w: u32, h: u32, max_bytes: usize) -> (Vec<u8
 }
 
 /// CF_DIB layout: BITMAPINFOHEADER followed directly by pixels (no RGBQUAD slot).
-pub fn as_cf_dib(isl: &[u8]) -> Vec<u8> {    if isl.len() < ISL_PIXELS {
+pub fn as_cf_dib(isl: &[u8]) -> Vec<u8> {
+    if isl.len() < ISL_PIXELS {
         return isl.to_vec();
     }
     let mut out = Vec::with_capacity(40 + isl.len() - ISL_PIXELS);
@@ -129,6 +130,27 @@ pub fn wrap_bmp(cf: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&54u32.to_le_bytes()); // bfOffBits
     out.extend_from_slice(cf);
     out
+}
+
+
+/// Decode PNG/JPEG/BMP/WEBP (or anything `image` supports) into RGB8 with
+/// alpha composited over white — same as the PNG path Citrix expects.
+pub fn decode_image(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    if bytes.first() == Some(&0x89) && bytes.get(1..4) == Some(b"PNG") {
+        return png_decode(bytes);
+    }
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    let data = rgba.into_raw();
+    let mut rgb = vec![0u8; w * h * 3];
+    for (i, px) in data.chunks_exact(4).enumerate() {
+        let a = px[3] as u16;
+        for (c, &v) in px[..3].iter().enumerate() {
+            rgb[i * 3 + c] = ((v as u16 * a + 255 * (255 - a)) / 255) as u8;
+        }
+    }
+    Some((rgb, w as u32, h as u32))
 }
 
 /// Decode a PNG into RGB8, compositing alpha over white (matches the Python
@@ -248,7 +270,7 @@ mod tests {
         let (w, h) = (3840u32, 2160u32);
         let rgb = vec![128u8; (w * h * 3) as usize];
         let max = 16_777_148usize;
-        let (out, nw, nh) = downscale_to_fit(&rgb, w, h, max);
+        let (_out, nw, nh) = downscale_to_fit(&rgb, w, h, max);
         assert!((nw, nh) != (w, h));
         assert!(ISL_PIXELS + (nw * nh * 4) as usize <= max);
         // aspect ratio roughly preserved
@@ -260,6 +282,16 @@ mod tests {
         let (s, sw, sh) = downscale_to_fit(&small, 4, 4, max);
         assert_eq!((sw, sh), (4, 4));
         assert_eq!(s, small);
+    }
+
+    #[test]
+    fn decode_image_png() {
+        let (w, h) = (2u32, 2u32);
+        let rgb = vec![10u8, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        let png = png_encode(&rgb, w, h).unwrap();
+        let (back, bw, bh) = decode_image(&png).expect("png via decode_image");
+        assert_eq!((bw, bh), (w, h));
+        assert_eq!(back, rgb);
     }
 
     #[test]

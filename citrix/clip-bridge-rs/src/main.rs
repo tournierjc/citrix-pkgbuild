@@ -6,10 +6,12 @@
 //!
 //! Differences from the Python daemon:
 //! - no GTK/PyGObject; ICCCM selection handling is done directly over x11rb
+//! - TARGETS omits image/png while bridging (avoids XWayland ownership steal)
 //! - _NET_ACTIVE_WINDOW is read natively instead of shelling out to xprop
 //! - the wl-paste --watch child re-execs /proc/self/exe instead of argv[0]
 //! - INCR receiving is implemented for the Citrix -> Wayland pull
-//! - PIXMAP and TIMESTAMP targets are not advertised (wfica picks _ISL_DIB)
+//! - PIXMAP is not advertised (wfica picks _ISL_DIB); TIMESTAMP is advertised
+//!   (ICCCM; GTK served it implicitly, which Citrix awaits after TARGETS)
 //! - uses XFixes/SelectionRequest timestamps (not CurrentTime) for
 //!   ConvertSelection / SetSelectionOwner; same-xid wfica re-asserts repull
 
@@ -116,6 +118,7 @@ struct Atoms {
     image_png: Atom,
     rgbquad: Atom,
     targets: Atom,
+    timestamp: Atom,
     wm_class: Atom,
     net_active_window: Atom,
     pull_prop: Atom,
@@ -137,6 +140,7 @@ fn intern_atoms(conn: &RustConnection) -> Result<Atoms, Box<dyn std::error::Erro
         image_png: get(b"image/png")?,
         rgbquad: get(b"_ISL_RGBQUAD")?,
         targets: get(b"TARGETS")?,
+        timestamp: get(b"TIMESTAMP")?,
         wm_class: get(b"WM_CLASS")?,
         net_active_window: get(b"_NET_ACTIVE_WINDOW")?,
         pull_prop: get(b"CITRIX_CLIP_BRIDGE_PULL")?,
@@ -202,11 +206,17 @@ struct Bridge {
     last_ingest_at: Option<Instant>,
     last_export_at: Option<Instant>,
     pull_cool_until: Option<Instant>,
+    /// True after a Wayland image ingest until we successfully export a
+    /// session image. While set, ignore empty wfica CLIPBOARD grabs (paste
+    /// into Citrix) and keep re-offering our DIB instead of pull-storming.
+    host_offer: bool,
     last_clip_owner: Window,
     /// Last non-zero X server timestamp observed (SelectionRequest / XFixes / …).
     /// wfica is picky: ConvertSelection/SetSelectionOwner with CurrentTime often
     /// returns property=None or never answers, while GTK's server time works.
     last_x_time: u32,
+    /// X server time of our last successful SetSelectionOwner (for TIMESTAMP).
+    owned_at: u32,
     /// Timestamp to stamp the in-flight ConvertSelection with.
     pull_time: u32,
     wfica_focused: bool,
@@ -365,7 +375,7 @@ impl Bridge {
         }
     }
 
-    fn offer_selections(&self) {
+    fn offer_selections(&mut self) {
         if !self.citrix_is_target() || self.dib.is_empty() {
             return;
         }
@@ -374,11 +384,19 @@ impl Bridge {
             .conn
             .set_selection_owner(self.holder, self.atoms.clipboard, t);
         let _ = self.conn.flush();
+        if self.we_own(self.atoms.clipboard) {
+            if t != 0 && t != CURRENT_TIME {
+                self.owned_at = t;
+            } else if self.last_x_time != 0 {
+                self.owned_at = self.last_x_time;
+            }
+        }
     }
 
     fn drop_clipboard_ownership(&mut self) {
         self.reassert_left = 0;
         self.pending_serve = false;
+        self.host_offer = false;
         self.ingest_seq += 1;
         self.dib.clear();
         self.png.clear();
@@ -391,6 +409,7 @@ impl Bridge {
         if !self.citrix_is_target() || self.dib.is_empty() {
             return;
         }
+        self.host_offer = true;
         self.pending_serve = true;
         self.ingest_seq += 1;
         let seq = self.ingest_seq;
@@ -412,8 +431,38 @@ impl Bridge {
         if !self.citrix_is_target() || self.dib.is_empty() {
             return;
         }
+        if self.we_own(self.atoms.clipboard) {
+            return;
+        }
         self.offer_selections();
         log("reclaimed CLIPBOARD after release");
+    }
+
+    /// Keep offering our cached DIB while a session is open.
+    ///
+    /// After we serve _ISL_DIB, wfica (or XWayland after reading image/png)
+    /// often takes CLIPBOARD and then drops it. Without this, owner stays
+    /// None / non-bridge and the next paste into Citrix finds no _ISL_DIB.
+    /// Do not steal from wfica after a successful serve (session copy path).
+    fn ensure_clipboard_offer(&mut self) {
+        if !self.citrix_is_target() || self.dib.is_empty() {
+            return;
+        }
+        if self.we_own(self.atoms.clipboard) {
+            return;
+        }
+        let xid = self.selection_owner(self.atoms.clipboard);
+        if xid != NONE && self.window_is_wfica(xid) && !self.pending_serve {
+            return;
+        }
+        self.offer_selections();
+        if xid == NONE {
+            log("restored CLIPBOARD offer (was unowned)");
+        } else if !self.window_is_wfica(xid) {
+            log(&format!("restored CLIPBOARD offer (was 0x{xid:x})"));
+        } else {
+            log("restored CLIPBOARD offer (pending serve, was wfica)");
+        }
     }
 
     /// If Citrix still has not fetched _ISL_DIB, force a fresh owner claim.
@@ -432,7 +481,11 @@ impl Bridge {
     }
 
     fn on_reassert(&mut self) {
-        if !self.session_active || self.reassert_left == 0 || self.dib.is_empty() {
+        if !self.session_active || self.dib.is_empty() {
+            return;
+        }
+        if self.reassert_left == 0 {
+            self.ensure_clipboard_offer();
             return;
         }
         self.reassert_left -= 1;
@@ -587,15 +640,36 @@ impl Bridge {
             self.reassert_left = 0;
         }
         if t == a.targets {
+            // Prefer Citrix formats first. Include TIMESTAMP (ICCCM; GTK did).
+            // Keep image/png out of TARGETS while bridging to Citrix: advertising
+            // it makes XWayland ConvertSelection then steal CLIPBOARD ownership,
+            // leaving owner=None before the user pastes into the session.
             let list = [
-                a.targets, a.isl_dib, a.dib, a.cf_dib, a.rgbquad, a.image_bmp, a.bmp,
-                a.image_png, a.png,
+                a.targets,
+                a.timestamp,
+                a.isl_dib,
+                a.dib,
+                a.cf_dib,
+                a.rgbquad,
+                a.image_bmp,
+                a.bmp,
             ];
             let mut data = Vec::with_capacity(list.len() * 4);
             for at in list {
                 data.extend_from_slice(&at.to_le_bytes());
             }
             self.answer(&ev, prop, AtomEnum::ATOM.into(), &data, 32);
+            return;
+        }
+        if t == a.timestamp {
+            let ts = if self.owned_at != 0 {
+                self.owned_at
+            } else if self.last_x_time != 0 {
+                self.last_x_time
+            } else {
+                ev.time
+            };
+            self.answer(&ev, prop, AtomEnum::INTEGER.into(), &ts.to_le_bytes(), 32);
             return;
         }
         if t == a.image_png || t == a.png {
@@ -663,12 +737,16 @@ impl Bridge {
             // After a Wayland ingest, Citrix often claims CLIPBOARD once it
             // has ConvertSelection'd _ISL_DIB. Pulling that ownership races
             // the C2H path and starts an empty-DIB storm.
-            if self
-                .last_ingest_at
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(20))
+            if self.host_offer
+                || self
+                    .last_ingest_at
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(20))
             {
                 self.session_pull_done = true;
                 log("selection-clear after Wayland ingest; skip pull");
+                if self.host_offer && !self.dib.is_empty() {
+                    self.schedule(Duration::from_millis(50), self.ingest_seq, TimerKind::Reclaim);
+                }
                 return;
             }
             self.session_pull_done = false;
@@ -677,6 +755,12 @@ impl Bridge {
                 self.ingest_seq,
                 TimerKind::PullRequest,
             );
+            return;
+        }
+        // Lost CLIPBOARD to XWayland / cleared owner. Re-offer so a later
+        // paste into Citrix still finds _ISL_DIB.
+        if !self.dib.is_empty() {
+            self.schedule(Duration::from_millis(40), self.ingest_seq, TimerKind::Reclaim);
         }
     }
 
@@ -722,6 +806,12 @@ impl Bridge {
         if self.session_pull_done {
             return;
         }
+        // Host→Citrix image is cached: do not treat wfica's CLIPBOARD grab
+        // (paste / format listing) as a session copy. That caused the
+        // 13:57 "pull empty" storm and "Impossible de charger l'image".
+        if self.host_offer && !self.dib.is_empty() {
+            return;
+        }
         if self.pull_cool_until.is_some_and(|t| now < t) {
             return;
         }
@@ -750,6 +840,9 @@ impl Bridge {
 
     fn poll_wfica_export(&mut self) {
         if !self.session_active || self.session_pull_done || self.reassert_left > 0 {
+            return;
+        }
+        if self.host_offer && !self.dib.is_empty() {
             return;
         }
         if self.we_own(self.atoms.clipboard) {
@@ -894,6 +987,18 @@ impl Bridge {
     }
 
     fn pull_failed(&mut self, pull: Pull) {
+        // During a host→Citrix offer, a refused _ISL_DIB means wfica is not
+        // exporting an image (paste/listing). Do not cascade through five
+        // empty formats — restore our DIB so the user can paste into Citrix.
+        if self.host_offer && !self.dib.is_empty() {
+            log("wfica probe empty during host offer; restoring CLIPBOARD");
+            self.import_pending = false;
+            self.pull = None;
+            self.session_pull_done = true;
+            self.pulled_owner_xid = pull.owner;
+            self.schedule(Duration::from_millis(40), self.ingest_seq, TimerKind::Reclaim);
+            return;
+        }
         let next = match pull.stage {
             PullStage::Isl => Some(PullStage::Dib),
             PullStage::Dib => Some(PullStage::CfDib),
@@ -953,6 +1058,7 @@ impl Bridge {
         self.img_h = h;
         self.reassert_left = 0;
         self.session_pull_done = true;
+        self.host_offer = false;
         self.last_export_at = Some(Instant::now());
         log(&format!("exported session image {w}x{h} to Wayland"));
     }
@@ -960,12 +1066,17 @@ impl Bridge {
     // ---- Wayland ingest ------------------------------------------------
 
     fn ingest_png(&mut self) {
-        let Ok(png) = fs::read(png_path()) else {
+        // Prefer bytes written by `--ingest` (stdin from wl-paste --type …);
+        // otherwise probe the Wayland clipboard for any common image MIME
+        // (clipboard-changed watch fires for text too — ignore those).
+        let bytes = fs::read(png_path())
+            .ok()
+            .filter(|b| !b.is_empty())
+            .or_else(fetch_wayland_image);
+        let Some(png) = bytes else {
+            log("clipboard changed; no Wayland image MIME found");
             return;
         };
-        if png.is_empty() {
-            return;
-        }
         if !self.wfica_running() {
             self.set_session_active(false, "ingest");
             return;
@@ -973,8 +1084,16 @@ impl Bridge {
         self.set_session_active(true, "ingest");
         let hash = hash_bytes(&png);
         // Same-png retries while pending_serve raced KWin and stole CLIPBOARD
-        // even with no Citrix session. c2h pokes already re-claim if needed.
+        // even with no Citrix session. If we already built this DIB but no
+        // longer own CLIPBOARD (XWayland/wfica dropped it), re-claim so a
+        // paste into Citrix still works. wl-paste --watch only fires on a
+        // *new* Wayland selection, so a silent return here also hides
+        // "user re-copied the same screenshot" when ownership was lost.
         if hash == self.last_hash {
+            if !self.dib.is_empty() && !self.we_own(self.atoms.clipboard) {
+                log("reingest same png; CLIPBOARD not owned, re-claiming");
+                self.claim_for_citrix("reingest");
+            }
             return;
         }
         if self
@@ -983,8 +1102,8 @@ impl Bridge {
         {
             return;
         }
-        let Some((rgb, w, h)) = dib::png_decode(&png) else {
-            log("png to DIB failed: decode error");
+        let Some((rgb, w, h)) = dib::decode_image(&png) else {
+            log("image to DIB failed: decode error");
             return;
         };
         // A 4K screenshot is ~33 MB as a DIB, over the X11 request limit;
@@ -1018,9 +1137,9 @@ impl Bridge {
         self.pull_cool_until = Some(Instant::now() + Duration::from_secs(2));
         self.pulled_owner_xid = 0;
         self.wfica_pull_tries = 0;
-        self.session_pull_done = false;
-        self.pending_serve = true;
-        self.ingest_seq += 1;
+        // Prefer host offer over session pull until a real session image arrives.
+        self.session_pull_done = true;
+        // claim_for_citrix sets pending_serve / ingest_seq / host_offer.
         self.claim_for_citrix("ingest");
     }
 
@@ -1033,19 +1152,48 @@ impl Bridge {
         self.note_time(ev.timestamp);
         self.note_time(ev.selection_timestamp);
         let xid = ev.owner;
-        // Destroy/close: just remember the owner is gone.
+        // Destroy/close: just remember the owner is gone; restore our offer
+        // if we still hold a DIB for the open session.
         if ev.subtype != xfixes::SelectionEvent::SET_SELECTION_OWNER {
             if xid == NONE {
                 self.last_clip_owner = NONE;
+                if !self.dib.is_empty() {
+                    self.schedule(Duration::from_millis(40), self.ingest_seq, TimerKind::Reclaim);
+                }
             }
             return;
         }
         let same_owner = xid == self.last_clip_owner;
         self.last_clip_owner = xid;
-        if xid == NONE || xid == self.holder {
+        if xid == self.holder {
+            return;
+        }
+        if xid == NONE {
+            if !self.dib.is_empty() {
+                self.schedule(Duration::from_millis(40), self.ingest_seq, TimerKind::Reclaim);
+            }
             return;
         }
         if !self.session_active || !self.window_is_wfica(xid) {
+            return;
+        }
+        // Host image cached: wfica grabbing CLIPBOARD is usually paste /
+        // Enter_clip (text formats only). Probe _ISL_DIB once; on refuse we
+        // restore the host offer (see pull_failed). A real session screenshot
+        // succeeds and clears host_offer via publish_session_image.
+        if self.host_offer && !self.dib.is_empty() {
+            if !same_owner {
+                log("xfixes: wfica took CLIPBOARD during host offer; probe _ISL_DIB");
+            }
+            self.pull_time = if ev.selection_timestamp != 0 {
+                ev.selection_timestamp
+            } else {
+                ev.timestamp
+            };
+            self.session_pull_done = false;
+            self.pulled_owner_xid = 0;
+            self.wfica_pull_tries = 0;
+            self.start_pull(xid, PullStage::Isl);
             return;
         }
         // Skip pulling back the image we just pushed into Citrix. wfica often
@@ -1237,6 +1385,54 @@ fn notify_daemon() {
         libc::write(fd, b"x".as_ptr().cast(), 1);
         libc::close(fd);
     }
+}
+
+/// Probe Wayland for any image MIME Citrix might need. Used when the
+/// untyped `wl-paste --watch` fires (covers jpeg/webp/bmp, not just png).
+fn fetch_wayland_image() -> Option<Vec<u8>> {
+    const MIMES: &[&str] = &[
+        "image/png",
+        "image/jpeg",
+        "image/jpg",
+        "image/bmp",
+        "image/webp",
+        "image/tiff",
+        "image/x-bmp",
+        "image/x-MS-bmp",
+    ];
+    for mime in MIMES {
+        let out = Command::new("wl-paste")
+            .args(["--type", mime])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+        match out {
+            Ok(o) if o.status.success() && o.stdout.len() > 32 => {
+                log(&format!(
+                    "wayland has {mime} ({} bytes)",
+                    o.stdout.len()
+                ));
+                // Cache for ingest_png's file-first path.
+                let _ = fs::write(png_path(), &o.stdout);
+                return Some(o.stdout);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// wl-paste --watch without --type: any clipboard change. Drain stdin
+/// (often text) and poke the daemon to probe image MIME types.
+fn clipboard_changed_mode() -> i32 {
+    let mut sink = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut sink);
+    if !wfica_running_scan() {
+        return 0;
+    }
+    notify_daemon();
+    0
 }
 
 fn ingest_mode() -> i32 {
@@ -1459,7 +1655,24 @@ fn daemon_mode(foreground: bool) -> i32 {
     };
 
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("clip-bridge-rs"));
-    let mut watch: Option<Child> = match Command::new("wl-paste")
+    // Untyped watch: fires on every Wayland clipboard change (jpeg/webp/text/…).
+    // Handler probes image MIME types so we do not miss non-png copies.
+    let mut watches: Vec<Child> = Vec::new();
+    match Command::new("wl-paste")
+        .arg("--watch")
+        .arg(&exe)
+        .arg("--clipboard-changed")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+    {
+        Ok(c) => watches.push(c),
+        Err(e) => log(&format!("wl-paste --watch spawn failed: {e}")),
+    }
+    // Fast path for the common Spectacle/KDE image/png case (stdin → file).
+    match Command::new("wl-paste")
         .args(["--type", "image/png", "--watch"])
         .arg(&exe)
         .arg("--ingest")
@@ -1469,11 +1682,8 @@ fn daemon_mode(foreground: bool) -> i32 {
         .process_group(0)
         .spawn()
     {
-        Ok(c) => Some(c),
-        Err(e) => {
-            log(&format!("wl-paste spawn failed: {e}"));
-            None
-        }
+        Ok(c) => watches.push(c),
+        Err(e) => log(&format!("wl-paste image/png watch failed: {e}")),
     };
 
     let _ = fs::write(pid_path(), std::process::id().to_string());
@@ -1501,8 +1711,10 @@ fn daemon_mode(foreground: bool) -> i32 {
         last_ingest_at: None,
         last_export_at: None,
         pull_cool_until: None,
+        host_offer: false,
         last_clip_owner: 0,
         last_x_time: 0,
+        owned_at: 0,
         pull_time: 0,
         wfica_focused: false,
         wfica_cache: None,
@@ -1512,13 +1724,13 @@ fn daemon_mode(foreground: bool) -> i32 {
     };
     br.poll_session();
     br.poll_focus();
-    log("watching Wayland image/png for X11 ISL_DIB (pixels at 0x428)");
+    log("watching Wayland clipboard images for X11 ISL_DIB (pixels at 0x428)");
     if !br.session_active {
         log("idle until a Citrix session starts");
     }
     let rc = run_loop(&mut br, notify_fd);
 
-    if let Some(mut w) = watch.take() {
+    for mut w in watches {
         let _ = w.kill();
         let _ = w.wait();
     }
@@ -1529,6 +1741,9 @@ fn daemon_mode(foreground: bool) -> i32 {
 fn main() -> std::process::ExitCode {
     log_init();
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().skip(1).any(|a| a == "--clipboard-changed") {
+        return std::process::ExitCode::from(clipboard_changed_mode() as u8);
+    }
     if args.iter().skip(1).any(|a| a == "--ingest" || a == "--convert") {
         return std::process::ExitCode::from(ingest_mode() as u8);
     }

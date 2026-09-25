@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
 libc = "0.2.189"
 png = "0.18.1"
 x11rb = { version = "0.14.0", features = ["xfixes"] }
