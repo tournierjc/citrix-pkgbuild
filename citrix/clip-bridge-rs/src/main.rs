@@ -390,7 +390,10 @@ impl Bridge {
     }
 
     fn offer_selections(&mut self) {
-        if !self.citrix_is_target() {
+        // Only while the Citrix window is focused. Holding CLIPBOARD the rest
+        // of the time makes KWin sync our stale/empty payload back onto the
+        // Wayland clipboard and breaks paste between Linux apps.
+        if !self.session_active || !self.wfica_focused {
             return;
         }
         let have_image = self.host_offer && !self.dib.is_empty();
@@ -426,20 +429,32 @@ impl Bridge {
         self.release_selections();
     }
 
-    /// Host copied text. Own X11 CLIPBOARD and serve UTF-8 ourselves — KWin's
-    /// Wayland→X11 sync often leaves owner=None, so Citrix paste fails until
-    /// the user copies again.
+    /// Host copied text. Cache it always; own X11 CLIPBOARD only while wfica
+    /// is focused so Linux-to-Linux paste keeps working.
     fn claim_for_text(&mut self, text: Vec<u8>) {
-        if !self.citrix_is_target() || text.is_empty() {
+        if !self.citrix_is_target() || text.iter().all(u8::is_ascii_whitespace) {
             return;
         }
-        if self.text_offer && text == self.text && self.we_own(self.atoms.clipboard) {
-            return;
-        }
+        let same = self.text_offer && text == self.text;
         self.text = text;
         self.host_offer = false;
         self.pending_serve = false;
         self.text_offer = true;
+        if !self.wfica_focused {
+            self.reassert_left = 0;
+            self.ingest_seq += 1;
+            self.release_selections();
+            if !same {
+                log(&format!(
+                    "cached text ({} bytes); left host clipboard alone",
+                    self.text.len()
+                ));
+            }
+            return;
+        }
+        if same && self.we_own(self.atoms.clipboard) {
+            return;
+        }
         self.ingest_seq += 1;
         let seq = self.ingest_seq;
         self.reassert_left = 4;
@@ -456,6 +471,18 @@ impl Bridge {
         self.text.clear();
         self.host_offer = true;
         self.pending_serve = true;
+        if !self.wfica_focused {
+            self.reassert_left = 0;
+            self.ingest_seq += 1;
+            self.release_selections();
+            log(&format!(
+                "cached DIB {}x{} ({} bytes); left host clipboard alone ({reason})",
+                self.img_w,
+                self.img_h,
+                self.dib.len()
+            ));
+            return;
+        }
         self.ingest_seq += 1;
         let seq = self.ingest_seq;
         self.reassert_left = 6;
@@ -473,7 +500,7 @@ impl Bridge {
     }
 
     fn reclaim_after_release(&mut self) {
-        if !self.citrix_is_target() {
+        if !self.wfica_focused {
             return;
         }
         if !self.host_offer && !self.text_offer {
@@ -494,6 +521,14 @@ impl Bridge {
 
     /// Keep offering our cached host payload while an offer is active.
     fn ensure_clipboard_offer(&mut self) {
+        if !self.wfica_focused {
+            if self.we_own(self.atoms.clipboard) {
+                self.reassert_left = 0;
+                self.release_selections();
+                log("released CLIPBOARD (wfica unfocused)");
+            }
+            return;
+        }
         if !self.citrix_is_target() {
             return;
         }
@@ -522,6 +557,7 @@ impl Bridge {
     /// If Citrix still has not fetched _ISL_DIB, force a fresh owner claim.
     fn poke_c2h_offer(&mut self, seq: u64, reason: &str) {
         if !self.citrix_is_target()
+            || !self.wfica_focused
             || seq != self.ingest_seq
             || !self.pending_serve
             || self.dib.is_empty()
@@ -535,6 +571,13 @@ impl Bridge {
     }
 
     fn on_reassert(&mut self) {
+        if !self.wfica_focused {
+            if self.we_own(self.atoms.clipboard) {
+                self.reassert_left = 0;
+                self.release_selections();
+            }
+            return;
+        }
         if !self.session_active {
             return;
         }
@@ -597,10 +640,15 @@ impl Bridge {
         }
         self.wfica_focused = focused;
         log(if focused { "wfica focused" } else { "wfica unfocused" });
-        if focused && self.host_offer && !self.dib.is_empty() {
+        if !focused {
+            self.reassert_left = 0;
+            self.release_selections();
+            log("released CLIPBOARD (wfica unfocused)");
+            return;
+        }
+        if self.host_offer && !self.dib.is_empty() {
             self.claim_for_citrix("focus");
-        } else if focused && self.text_offer && !self.text.is_empty() {
-            // Re-claim without re-reading Wayland (same bytes).
+        } else if self.text_offer && !self.text.is_empty() {
             let text = self.text.clone();
             self.claim_for_text(text);
         }
