@@ -405,6 +405,21 @@ impl Bridge {
         self.release_selections();
     }
 
+    /// Host copied text (or other non-image). Drop CLIPBOARD so KWin/XWayland
+    /// can sync it to wfica. Keep the last DIB cached so a later image
+    /// re-claim (fresh ingest) still works; do not keep reclaiming over text.
+    fn yield_to_host_text(&mut self) {
+        if !self.host_offer && !self.we_own(self.atoms.clipboard) && self.reassert_left == 0 {
+            return;
+        }
+        self.reassert_left = 0;
+        self.pending_serve = false;
+        self.host_offer = false;
+        self.ingest_seq += 1; // cancel outstanding reclaim/poke timers
+        self.release_selections();
+        log("yielded CLIPBOARD to host text clipboard");
+    }
+
     fn claim_for_citrix(&mut self, reason: &str) {
         if !self.citrix_is_target() || self.dib.is_empty() {
             return;
@@ -428,7 +443,7 @@ impl Bridge {
     }
 
     fn reclaim_after_release(&mut self) {
-        if !self.citrix_is_target() || self.dib.is_empty() {
+        if !self.citrix_is_target() || self.dib.is_empty() || !self.host_offer {
             return;
         }
         if self.we_own(self.atoms.clipboard) {
@@ -438,14 +453,15 @@ impl Bridge {
         log("reclaimed CLIPBOARD after release");
     }
 
-    /// Keep offering our cached DIB while a session is open.
+    /// Keep offering our cached DIB while a host image offer is active.
     ///
     /// After we serve _ISL_DIB, wfica (or XWayland after reading image/png)
     /// often takes CLIPBOARD and then drops it. Without this, owner stays
     /// None / non-bridge and the next paste into Citrix finds no _ISL_DIB.
-    /// Do not steal from wfica after a successful serve (session copy path).
+    /// Do not steal from wfica after a successful serve (session copy path),
+    /// and do not reclaim after the host switched to text (host_offer=false).
     fn ensure_clipboard_offer(&mut self) {
-        if !self.citrix_is_target() || self.dib.is_empty() {
+        if !self.citrix_is_target() || self.dib.is_empty() || !self.host_offer {
             return;
         }
         if self.we_own(self.atoms.clipboard) {
@@ -481,7 +497,7 @@ impl Bridge {
     }
 
     fn on_reassert(&mut self) {
-        if !self.session_active || self.dib.is_empty() {
+        if !self.session_active || self.dib.is_empty() || !self.host_offer {
             return;
         }
         if self.reassert_left == 0 {
@@ -538,7 +554,10 @@ impl Bridge {
         }
         self.wfica_focused = focused;
         log(if focused { "wfica focused" } else { "wfica unfocused" });
-        if focused && !self.dib.is_empty() {
+        // Only re-claim on focus while a host *image* offer is active. Doing
+        // this whenever dib is non-empty stole CLIPBOARD from KWin after every
+        // Linux text copy, so paste into Citrix needed several retries.
+        if focused && self.host_offer && !self.dib.is_empty() {
             self.claim_for_citrix("focus");
         }
     }
@@ -1074,7 +1093,14 @@ impl Bridge {
             .filter(|b| !b.is_empty())
             .or_else(fetch_wayland_image);
         let Some(png) = bytes else {
-            log("clipboard changed; no Wayland image MIME found");
+            // Text (or empty) host clipboard: yield so KWin can sync to X11.
+            // If an image MIME is advertised but bytes are not ready yet, do
+            // not yield — the image/png --watch ingest will follow.
+            if wayland_clipboard_is_text_only() {
+                self.yield_to_host_text();
+            } else {
+                log("clipboard changed; no Wayland image MIME found");
+            }
             return;
         };
         if !self.wfica_running() {
@@ -1385,6 +1411,33 @@ fn notify_daemon() {
         libc::write(fd, b"x".as_ptr().cast(), 1);
         libc::close(fd);
     }
+}
+
+/// True when Wayland CLIPBOARD is text and has no image/* type. Used to
+/// decide whether to yield X11 CLIPBOARD ownership back to KWin.
+fn wayland_clipboard_is_text_only() -> bool {
+    let Ok(out) = Command::new("wl-paste")
+        .arg("--list-types")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() || out.stdout.is_empty() {
+        return false;
+    }
+    let types = String::from_utf8_lossy(&out.stdout);
+    let has_image = types.lines().any(|l| l.starts_with("image/"));
+    let has_text = types.lines().any(|l| {
+        l.starts_with("text/")
+            || l == "UTF8_STRING"
+            || l == "STRING"
+            || l == "TEXT"
+            || l == "COMPOUND_TEXT"
+    });
+    has_text && !has_image
 }
 
 /// Probe Wayland for any image MIME Citrix might need. Used when the
