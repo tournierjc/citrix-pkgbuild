@@ -17,6 +17,56 @@ if [ ! -x "$REALWFICA" ]; then
   exit 127
 fi
 
+# ~/.ICAClient/All_Regions.ini overrides the packaged one. Empty
+# KeyboardLayout=/UseEUKS=* lets StoreFront force US QWERTY onto nested
+# MSTSC / Winlogon. Re-pin AZERTY + EUKS on every launch.
+if [ -f "${HOME:-}/.ICAClient/All_Regions.ini" ]; then
+  python3 - "${HOME}/.ICAClient/All_Regions.ini" <<'PY' 2>/dev/null || true
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+section = "[Virtual Channels\\Keyboard]"
+updates = {
+    "KeyboardLayout": "French",
+    "KeyboardEventMode": "Scancode",
+    "KeyboardSyncMode": "Once",
+    "KeyboardMappingFile": "automatic.kbd",
+    "KeyboardSendLocale": "True",
+    "UseEUKS": "2",
+    "UseEUKSforASCII": "True",
+    "ScancodeEnabled": "True",
+}
+raw = path.read_text()
+newline = "\r\n" if "\r\n" in raw else "\n"
+lines = raw.splitlines()
+try:
+    idx = next(i for i, line in enumerate(lines) if line.strip() == section)
+except StopIteration:
+    sys.exit(0)
+end = idx + 1
+while end < len(lines):
+    s = lines[end].strip()
+    if s.startswith("[") and s.endswith("]"):
+        break
+    end += 1
+done = set()
+for i in range(idx + 1, end):
+    line = lines[i]
+    if not line or line.lstrip().startswith(";") or "=" not in line:
+        continue
+    key = line.split("=", 1)[0].strip()
+    if key in updates:
+        lines[i] = f"{key}={updates[key]}"
+        done.add(key)
+ins = idx + 1
+for key, value in updates.items():
+    if key not in done:
+        lines.insert(ins, f"{key}={value}")
+        ins += 1
+path.write_text(newline.join(lines) + newline)
+PY
+fi
+
 # Clip bridge is a user systemd service. Keep a fallback start if it is not
 # running yet; do not kill a systemd-managed instance on every wfica launch.
 if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -x "$ICAROOT/util/clip-bridge-rs" ]; then
