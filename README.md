@@ -56,7 +56,7 @@ that screen. For a permanent logon-layout fix, copy the French layout to the
 Windows welcome screen (Settings → Time & language → Administrative language
 settings).
 
-## Image clipboard (Wayland ↔ Citrix)
+## Clipboard (Wayland ↔ Citrix)
 
 Plasma copies screenshots as Wayland `image/png`. `wfica` only imports X11
 `DIB` / `_ISL_DIB` / `PIXMAP`. The daemon
@@ -64,12 +64,20 @@ Plasma copies screenshots as Wayland `image/png`. `wfica` only imports X11
 `citrix-clip-bridge` is still installed as a fallback):
 
 - watches Wayland `image/png` (`wl-paste --watch`) and caches a Citrix DIB
-- while a session is open, owns X11 `CLIPBOARD` and offers `_ISL_DIB`
-  (32bpp, pixels at offset `0x428`, one-shot `XChangeProperty` with
-  BIG-REQUESTS) plus `image/png`, so pasting works in both Citrix and Linux
+- while a Citrix window is focused, owns X11 `CLIPBOARD` and offers
+  `_ISL_DIB` (32bpp, pixels at offset `0x428`, one-shot `XChangeProperty`
+  with BIG-REQUESTS)
 - does not take `PRIMARY` (Linux middle-click)
-- pulls `_ISL_DIB` from `wfica` when you copy in the session and publishes
-  `image/png` with `wl-copy`
+- when you copy in the session, reads the text (or `_ISL_DIB` image) straight
+  from `wfica`, keeps the Wayland clipboard empty while Citrix stays focused,
+  and publishes the copy with `wl-copy` once focus leaves Citrix
+
+Linux → Citrix text needs no bridge: KWin pushes the Wayland clipboard onto
+X11 whenever a Citrix window gains focus. The empty-while-focused rule works
+around a KWin race: on each new session copy `wfica` drops X11 `CLIPBOARD`
+for a moment before re-taking it, KWin fills that gap with its stale copy of
+the previous clipboard, and `wfica` then replaces the session clipboard with
+it (a Ctrl+C in Citrix seemed to need pressing twice).
 - downscales images above the X11 BIG-REQUESTS limit (~16 MB, e.g. a
   full-screen 4K capture becomes ~2730x1535) so the paste still works;
   wfica cannot reassemble INCR chunks, so chunking is not an option

@@ -7,7 +7,8 @@
 //! Differences from the Python daemon:
 //! - no GTK/PyGObject; ICCCM selection handling is done directly over x11rb
 //! - TARGETS omits image/png while bridging (avoids XWayland ownership steal)
-//! - _NET_ACTIVE_WINDOW is read natively instead of shelling out to xprop
+//! - focus is read with GetInputFocus and wfica windows are identified by
+//!   their client PID (X-Resource), so seamless published apps count too
 //! - the wl-paste --watch child re-execs /proc/self/exe instead of argv[0]
 //! - INCR receiving is implemented for the Citrix -> Wayland pull
 //! - PIXMAP is not advertised (wfica picks _ISL_DIB); TIMESTAMP is advertised
@@ -17,6 +18,7 @@
 
 mod dib;
 
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::CString;
 use std::fs;
@@ -30,6 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use x11rb::connection::{Connection, RequestConnection};
+use x11rb::protocol::res::{ClientIdMask, ClientIdSpec, ConnectionExt as _};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode, Property,
@@ -124,7 +127,6 @@ struct Atoms {
     text_plain: Atom,
     text_plain_utf8: Atom,
     wm_class: Atom,
-    net_active_window: Atom,
     pull_prop: Atom,
     incr: Atom,
 }
@@ -150,7 +152,6 @@ fn intern_atoms(conn: &RustConnection) -> Result<Atoms, Box<dyn std::error::Erro
         text_plain: get(b"text/plain")?,
         text_plain_utf8: get(b"text/plain;charset=utf-8")?,
         wm_class: get(b"WM_CLASS")?,
-        net_active_window: get(b"_NET_ACTIVE_WINDOW")?,
         pull_prop: get(b"CITRIX_CLIP_BRIDGE_PULL")?,
         incr: get(b"INCR")?,
     })
@@ -158,6 +159,8 @@ fn intern_atoms(conn: &RustConnection) -> Result<Atoms, Box<dyn std::error::Erro
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PullStage {
+    Targets,
+    Text,
     Isl,
     Dib,
     CfDib,
@@ -173,6 +176,7 @@ struct Incr {
 struct Pull {
     owner: Window,
     stage: PullStage,
+    target: Atom,
     deadline: Instant,
     incr: Option<Incr>,
 }
@@ -184,6 +188,12 @@ enum TimerKind {
     PullRequest,
 }
 
+/// A session copy, held back from Wayland while wfica is focused.
+enum SessionExport {
+    Text(Vec<u8>),
+    Png(Vec<u8>),
+}
+
 struct Timer {
     at: Instant,
     seq: u64,
@@ -193,14 +203,11 @@ struct Timer {
 struct Bridge {
     conn: RustConnection,
     holder: Window,
-    root: Window,
     atoms: Atoms,
     max_prop: usize,
 
     dib: Vec<u8>,
     png: Vec<u8>,
-    /// UTF-8 text from Wayland, served as UTF8_STRING on X11 CLIPBOARD.
-    text: Vec<u8>,
     img_w: u32,
     img_h: u32,
     last_hash: u64,
@@ -212,7 +219,6 @@ struct Bridge {
     reassert_left: u32,
     ingest_seq: u64,
     pulled_owner_xid: Window,
-    wfica_pull_tries: u32,
     last_ingest_at: Option<Instant>,
     last_export_at: Option<Instant>,
     pull_cool_until: Option<Instant>,
@@ -220,10 +226,6 @@ struct Bridge {
     /// session image. While set, ignore empty wfica CLIPBOARD grabs (paste
     /// into Citrix) and keep re-offering our DIB instead of pull-storming.
     host_offer: bool,
-    /// True while we own/serve host text on X11 (KWin's Wayland↔X11 sync is
-    /// flaky; without this, CLIPBOARD owner often ends up None and Citrix
-    /// paste needs several copy retries).
-    text_offer: bool,
     last_clip_owner: Window,
     /// Last non-zero X server timestamp observed (SelectionRequest / XFixes / …).
     /// wfica is picky: ConvertSelection/SetSelectionOwner with CurrentTime often
@@ -236,6 +238,13 @@ struct Bridge {
     wfica_focused: bool,
     wfica_cache: Option<(Instant, bool)>,
     focus_cache: Option<(Instant, bool)>,
+    wfica_xids: HashMap<Window, bool>,
+    /// While wfica is focused the Wayland clipboard must stay empty: on a new
+    /// session copy wfica sets the X11 owner to None before re-taking it, and
+    /// KWin fills that gap with its stale mirror of the previous Wayland
+    /// selection. wfica then forwards that as a host copy and the VDA's real
+    /// clipboard is replaced by data nobody can render.
+    session_export: Option<SessionExport>,
 
     pull: Option<Pull>,
     timers: Vec<Timer>,
@@ -286,8 +295,38 @@ impl Bridge {
         text.contains("Wfica") || text.contains("wfica")
     }
 
+    fn window_pid(&self, xid: Window) -> Option<u32> {
+        let spec = ClientIdSpec {
+            client: xid,
+            mask: ClientIdMask::LOCAL_CLIENT_PID,
+        };
+        let reply = self.conn.res_query_client_ids(&[spec]).ok()?.reply().ok()?;
+        reply.ids.first()?.value.first().copied()
+    }
+
+    /// Seamless published-app windows carry the remote title as WM_CLASS and
+    /// no _NET_WM_PID, so identify wfica by the owning client's PID first.
+    fn window_is_wfica(&mut self, xid: Window) -> bool {
+        if xid == NONE || xid == self.holder {
+            return false;
+        }
+        if let Some(&known) = self.wfica_xids.get(&xid) {
+            return known;
+        }
+        let is = match self.window_pid(xid) {
+            Some(pid) => fs::read(format!("/proc/{pid}/cmdline"))
+                .is_ok_and(|cmd| bytes_contain(&cmd, WFICA_BIN)),
+            None => self.class_tree_is_wfica(xid),
+        };
+        if self.wfica_xids.len() > 256 {
+            self.wfica_xids.clear();
+        }
+        self.wfica_xids.insert(xid, is);
+        is
+    }
+
     /// wfica's CLIPBOARD owner is an unmapped child without WM_CLASS.
-    fn window_is_wfica(&self, xid: Window) -> bool {
+    fn class_tree_is_wfica(&self, xid: Window) -> bool {
         let mut cur = xid;
         for _ in 0..10 {
             if cur == NONE {
@@ -311,11 +350,8 @@ impl Bridge {
         false
     }
 
-    fn owner_is_wfica(&self, sel: Atom) -> bool {
+    fn owner_is_wfica(&mut self, sel: Atom) -> bool {
         let xid = self.selection_owner(sel);
-        if xid == NONE || xid == self.holder {
-            return false;
-        }
         self.window_is_wfica(xid)
     }
 
@@ -330,39 +366,29 @@ impl Bridge {
         alive
     }
 
-    fn active_window_is_wfica(&self) -> bool {
-        let Some(reply) = self
+    /// Under XWayland the X11 input focus is exact: a focused Wayland app
+    /// shows up as KWin's own window, never as a stale X11 client.
+    fn focused_window_is_wfica(&mut self) -> bool {
+        let Some(focus) = self
             .conn
-            .get_property(
-                false,
-                self.root,
-                self.atoms.net_active_window,
-                AtomEnum::WINDOW,
-                0,
-                1,
-            )
+            .get_input_focus()
             .ok()
             .and_then(|c| c.reply().ok())
+            .map(|r| r.focus)
         else {
             return false;
         };
-        let Some(xid) = reply
-            .value
-            .first_chunk::<4>()
-            .map(|b| u32::from_le_bytes(*b))
-        else {
-            return false;
-        };
-        xid != 0 && self.window_is_wfica(xid)
+        // 1 is PointerRoot.
+        focus > 1 && self.window_is_wfica(focus)
     }
 
     fn wfica_is_focused(&mut self) -> bool {
         if let Some((ts, cached)) = self.focus_cache {
-            if ts.elapsed() < Duration::from_millis(200) {
+            if ts.elapsed() < Duration::from_millis(50) {
                 return cached;
             }
         }
-        let focused = self.active_window_is_wfica();
+        let focused = self.focused_window_is_wfica();
         self.focus_cache = Some((Instant::now(), focused));
         focused
     }
@@ -396,9 +422,7 @@ impl Bridge {
         if !self.session_active || !self.wfica_focused {
             return;
         }
-        let have_image = self.host_offer && !self.dib.is_empty();
-        let have_text = self.text_offer && !self.text.is_empty();
-        if !have_image && !have_text {
+        if !self.host_offer || self.dib.is_empty() {
             return;
         }
         let t = if self.last_x_time != 0 { self.last_x_time } else { CURRENT_TIME };
@@ -419,56 +443,18 @@ impl Bridge {
         self.reassert_left = 0;
         self.pending_serve = false;
         self.host_offer = false;
-        self.text_offer = false;
         self.ingest_seq += 1;
         self.dib.clear();
         self.png.clear();
-        self.text.clear();
         self.img_w = 0;
         self.img_h = 0;
         self.release_selections();
-    }
-
-    /// Host copied text. Cache it always; own X11 CLIPBOARD only while wfica
-    /// is focused so Linux-to-Linux paste keeps working.
-    fn claim_for_text(&mut self, text: Vec<u8>) {
-        if !self.citrix_is_target() || text.iter().all(u8::is_ascii_whitespace) {
-            return;
-        }
-        let same = self.text_offer && text == self.text;
-        self.text = text;
-        self.host_offer = false;
-        self.pending_serve = false;
-        self.text_offer = true;
-        if !self.wfica_focused {
-            self.reassert_left = 0;
-            self.ingest_seq += 1;
-            self.release_selections();
-            if !same {
-                log(&format!(
-                    "cached text ({} bytes); left host clipboard alone",
-                    self.text.len()
-                ));
-            }
-            return;
-        }
-        if same && self.we_own(self.atoms.clipboard) {
-            return;
-        }
-        self.ingest_seq += 1;
-        let seq = self.ingest_seq;
-        self.reassert_left = 4;
-        self.release_selections();
-        self.schedule(Duration::from_millis(40), seq, TimerKind::Reclaim);
-        log(&format!("offered text ({} bytes)", self.text.len()));
     }
 
     fn claim_for_citrix(&mut self, reason: &str) {
         if !self.citrix_is_target() || self.dib.is_empty() {
             return;
         }
-        self.text_offer = false;
-        self.text.clear();
         self.host_offer = true;
         self.pending_serve = true;
         if !self.wfica_focused {
@@ -503,13 +489,7 @@ impl Bridge {
         if !self.wfica_focused {
             return;
         }
-        if !self.host_offer && !self.text_offer {
-            return;
-        }
-        if self.host_offer && self.dib.is_empty() {
-            return;
-        }
-        if self.text_offer && self.text.is_empty() {
+        if !self.host_offer || self.dib.is_empty() {
             return;
         }
         if self.we_own(self.atoms.clipboard) {
@@ -529,12 +509,7 @@ impl Bridge {
             }
             return;
         }
-        if !self.citrix_is_target() {
-            return;
-        }
-        let have_image = self.host_offer && !self.dib.is_empty();
-        let have_text = self.text_offer && !self.text.is_empty();
-        if !have_image && !have_text {
+        if !self.citrix_is_target() || !self.host_offer || self.dib.is_empty() {
             return;
         }
         if self.we_own(self.atoms.clipboard) {
@@ -578,12 +553,7 @@ impl Bridge {
             }
             return;
         }
-        if !self.session_active {
-            return;
-        }
-        let have_image = self.host_offer && !self.dib.is_empty();
-        let have_text = self.text_offer && !self.text.is_empty();
-        if !have_image && !have_text {
+        if !self.session_active || !self.host_offer || self.dib.is_empty() {
             return;
         }
         if self.reassert_left == 0 {
@@ -644,13 +614,11 @@ impl Bridge {
             self.reassert_left = 0;
             self.release_selections();
             log("released CLIPBOARD (wfica unfocused)");
+            self.publish_session_export();
             return;
         }
         if self.host_offer && !self.dib.is_empty() {
             self.claim_for_citrix("focus");
-        } else if self.text_offer && !self.text.is_empty() {
-            let text = self.text.clone();
-            self.claim_for_text(text);
         }
     }
 
@@ -745,41 +713,25 @@ impl Bridge {
             a.rgbquad,
             a.bmp,
             a.png,
-            a.utf8_string,
-            a.text,
-            a.text_plain,
-            a.text_plain_utf8,
         ]
         .contains(&t)
         {
             self.reassert_left = 0;
         }
         if t == a.targets {
-            let list: Vec<Atom> = if self.text_offer && !self.text.is_empty() {
-                vec![
-                    a.targets,
-                    a.timestamp,
-                    a.utf8_string,
-                    a.text_plain_utf8,
-                    a.text_plain,
-                    a.text,
-                    AtomEnum::STRING.into(),
-                ]
-            } else {
-                // Prefer Citrix formats first. Keep image/png out of TARGETS
-                // while bridging to Citrix: advertising it makes XWayland
-                // ConvertSelection then steal CLIPBOARD ownership.
-                vec![
-                    a.targets,
-                    a.timestamp,
-                    a.isl_dib,
-                    a.dib,
-                    a.cf_dib,
-                    a.rgbquad,
-                    a.image_bmp,
-                    a.bmp,
-                ]
-            };
+            // Prefer Citrix formats first. Keep image/png out of TARGETS
+            // while bridging to Citrix: advertising it makes XWayland
+            // ConvertSelection then steal CLIPBOARD ownership.
+            let list = [
+                a.targets,
+                a.timestamp,
+                a.isl_dib,
+                a.dib,
+                a.cf_dib,
+                a.rgbquad,
+                a.image_bmp,
+                a.bmp,
+            ];
             let mut data = Vec::with_capacity(list.len() * 4);
             for at in list {
                 data.extend_from_slice(&at.to_le_bytes());
@@ -796,27 +748,6 @@ impl Bridge {
                 ev.time
             };
             self.answer(&ev, prop, AtomEnum::INTEGER.into(), &ts.to_le_bytes(), 32);
-            return;
-        }
-        if t == a.utf8_string
-            || t == a.text
-            || t == a.text_plain
-            || t == a.text_plain_utf8
-            || t == AtomEnum::STRING.into()
-        {
-            if self.text.is_empty() {
-                self.refuse(&ev);
-            } else {
-                let n = self.text.len();
-                let type_ = if t == AtomEnum::STRING.into() {
-                    AtomEnum::STRING.into()
-                } else {
-                    a.utf8_string
-                };
-                if self.answer(&ev, prop, type_, &self.text, 8) {
-                    log(&format!("served text {n} bytes"));
-                }
-            }
             return;
         }
         if t == a.image_png || t == a.png {
@@ -877,39 +808,15 @@ impl Bridge {
             return;
         }
         if self.owner_is_wfica(self.atoms.clipboard) {
-            // Mid-_ISL_DIB transfer: do not reclaim.
+            // Session copy; the XFixes handler captures it.
             if !self.pending_serve {
                 self.reassert_left = 0;
             }
-            // After a Wayland ingest, Citrix often claims CLIPBOARD once it
-            // has ConvertSelection'd _ISL_DIB. Pulling that ownership races
-            // the C2H path and starts an empty-DIB storm.
-            if self.host_offer
-                || self.text_offer
-                || self
-                    .last_ingest_at
-                    .is_some_and(|t| t.elapsed() < Duration::from_secs(20))
-            {
-                self.session_pull_done = true;
-                log("selection-clear after Wayland ingest; skip pull");
-                if (self.host_offer && !self.dib.is_empty())
-                    || (self.text_offer && !self.text.is_empty())
-                {
-                    self.schedule(Duration::from_millis(50), self.ingest_seq, TimerKind::Reclaim);
-                }
-                return;
-            }
-            self.session_pull_done = false;
-            self.schedule(
-                Duration::from_millis(300),
-                self.ingest_seq,
-                TimerKind::PullRequest,
-            );
             return;
         }
         // Lost CLIPBOARD to XWayland / cleared owner. Re-offer so a later
         // paste into Citrix still finds our payload.
-        if (self.host_offer && !self.dib.is_empty()) || (self.text_offer && !self.text.is_empty()) {
+        if self.host_offer && !self.dib.is_empty() {
             self.schedule(Duration::from_millis(40), self.ingest_seq, TimerKind::Reclaim);
         }
     }
@@ -918,6 +825,8 @@ impl Bridge {
 
     fn start_pull(&mut self, owner: Window, stage: PullStage) {
         let target = match stage {
+            PullStage::Targets => self.atoms.targets,
+            PullStage::Text => self.atoms.utf8_string,
             PullStage::Isl => self.atoms.isl_dib,
             PullStage::Dib => self.atoms.dib,
             PullStage::CfDib => self.atoms.cf_dib,
@@ -928,7 +837,7 @@ impl Bridge {
         self.pull_cool_until = Some(Instant::now() + Duration::from_millis(800));
         let t = self.stamp();
         log(&format!(
-            "pull image from wfica owner 0x{owner:x} ({stage:?}) time={t}"
+            "pull from wfica owner 0x{owner:x} ({stage:?}) time={t}"
         ));
         // ICCCM: property should not already hold leftover data from a prior pull.
         let _ = self.conn.delete_property(self.holder, self.atoms.pull_prop);
@@ -943,9 +852,85 @@ impl Bridge {
         self.pull = Some(Pull {
             owner,
             stage,
+            target,
             deadline: Instant::now() + Duration::from_secs(5),
             incr: None,
         });
+    }
+
+    /// wfica set the X11 owner: a copy inside the session. Read it straight
+    /// from wfica, then empty the Wayland clipboard (see `session_export`).
+    fn on_session_copy(&mut self, owner: Window) {
+        self.host_offer = false;
+        self.pending_serve = false;
+        self.reassert_left = 0;
+        self.ingest_seq += 1;
+        self.session_export = None;
+        self.session_pull_done = false;
+        self.pulled_owner_xid = 0;
+        self.pull = None;
+        self.start_pull(owner, PullStage::Targets);
+    }
+
+    fn on_targets_pulled(&mut self, pull: Pull, data: &[u8]) {
+        let a = self.atoms;
+        let atoms: Vec<Atom> = data
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let has = |list: &[Atom]| atoms.iter().any(|t| list.contains(t));
+        if has(&[a.utf8_string, AtomEnum::STRING.into(), a.text, a.text_plain_utf8, a.text_plain]) {
+            self.start_pull(pull.owner, PullStage::Text);
+        } else if has(&[a.isl_dib, a.dib, a.cf_dib, a.image_bmp, a.image_png]) {
+            self.start_pull(pull.owner, PullStage::Isl);
+        } else {
+            log(&format!("session copy has no text or image ({} targets)", atoms.len()));
+            self.session_capture_done(pull.owner, None);
+        }
+    }
+
+    fn on_text_pulled(&mut self, pull: Pull, type_: Atom, mut data: Vec<u8>) {
+        while data.last() == Some(&0) {
+            data.pop();
+        }
+        if type_ == Atom::from(AtomEnum::STRING) {
+            data = data.iter().map(|&b| b as char).collect::<String>().into_bytes();
+        }
+        if data.is_empty() {
+            self.session_capture_done(pull.owner, None);
+            return;
+        }
+        log(&format!("pulled session text ({} bytes)", data.len()));
+        self.session_capture_done(pull.owner, Some(SessionExport::Text(data)));
+    }
+
+    fn session_capture_done(&mut self, owner: Window, export: Option<SessionExport>) {
+        self.import_pending = false;
+        self.pull = None;
+        self.session_pull_done = true;
+        self.pulled_owner_xid = owner;
+        self.session_export = export;
+        self.last_export_at = Some(Instant::now());
+        if self.wfica_focused {
+            wl_copy(&["--clear"], Vec::new());
+            log("cleared Wayland clipboard until wfica loses focus");
+        } else {
+            self.publish_session_export();
+        }
+    }
+
+    fn publish_session_export(&mut self) {
+        match self.session_export.take() {
+            Some(SessionExport::Text(text)) => {
+                log(&format!("exported session text ({} bytes) to Wayland", text.len()));
+                wl_copy(&[], text);
+            }
+            Some(SessionExport::Png(png)) => {
+                log(&format!("exported session image ({} bytes) to Wayland", png.len()));
+                wl_copy(&["--type", "image/png"], png);
+            }
+            None => {}
+        }
     }
 
     fn request_wfica_image(&mut self) {
@@ -958,7 +943,7 @@ impl Bridge {
         }
         // Host→Citrix payload is cached: do not treat wfica's CLIPBOARD grab
         // (paste / format listing) as a session copy.
-        if (self.host_offer && !self.dib.is_empty()) || (self.text_offer && !self.text.is_empty())
+        if self.host_offer && !self.dib.is_empty()
         {
             return;
         }
@@ -985,14 +970,14 @@ impl Bridge {
         if xid != NONE && xid == self.pulled_owner_xid {
             return;
         }
-        self.start_pull(xid, PullStage::Isl);
+        self.start_pull(xid, PullStage::Targets);
     }
 
     fn poll_wfica_export(&mut self) {
         if !self.session_active || self.session_pull_done || self.reassert_left > 0 {
             return;
         }
-        if (self.host_offer && !self.dib.is_empty()) || (self.text_offer && !self.text.is_empty())
+        if self.host_offer && !self.dib.is_empty()
         {
             return;
         }
@@ -1009,7 +994,7 @@ impl Bridge {
         let Some(pull) = self.pull.take() else {
             return;
         };
-        if pull.incr.is_some() {
+        if pull.incr.is_some() || ev.target != pull.target {
             // Already streaming chunks; ignore stray notifies, keep the pull.
             self.pull = Some(pull);
             return;
@@ -1066,7 +1051,13 @@ impl Bridge {
         let _ = self.conn.delete_property(self.holder, ev.property);
         let _ = self.conn.flush();
         log(&format!("pull {} {} bytes", self.target_name(ev.target), data.len()));
+        self.pull_data(pull, reply.type_, data);
+    }
+
+    fn pull_data(&mut self, pull: Pull, type_: Atom, data: Vec<u8>) {
         let img = match pull.stage {
+            PullStage::Targets => return self.on_targets_pulled(pull, &data),
+            PullStage::Text => return self.on_text_pulled(pull, type_, data),
             PullStage::ImagePng => dib::png_decode(&data),
             PullStage::ImageBmp => {
                 // CF_DIB wrapped in a BMP file header (14 bytes), or raw DIB.
@@ -1082,7 +1073,7 @@ impl Bridge {
         match img {
             Some(img) => self.pull_done(pull, Some(img)),
             None => {
-                log(&format!("pull {}: could not parse image", self.target_name(ev.target)));
+                log(&format!("pull {}: could not parse image", self.target_name(pull.target)));
                 self.pull_failed(pull);
             }
         }
@@ -1131,13 +1122,15 @@ impl Bridge {
         let data = std::mem::take(&mut incr.buf);
         let pull = self.pull.take().expect("pull checked above");
         log(&format!("pull INCR complete, {} bytes", data.len()));
-        match dib::isl_dib_to_rgb(&data) {
-            Some(img) => self.pull_done(pull, Some(img)),
-            None => self.pull_failed(pull),
-        }
+        self.pull_data(pull, reply.type_, data);
     }
 
     fn pull_failed(&mut self, pull: Pull) {
+        if matches!(pull.stage, PullStage::Targets | PullStage::Text) {
+            log(&format!("pull {:?} failed; session copy not captured", pull.stage));
+            self.session_capture_done(pull.owner, None);
+            return;
+        }
         // During a host→Citrix offer, a refused _ISL_DIB means wfica is not
         // exporting an image (paste/listing). Do not cascade through five
         // empty formats — restore our DIB so the user can paste into Citrix.
@@ -1150,21 +1143,12 @@ impl Bridge {
             self.schedule(Duration::from_millis(40), self.ingest_seq, TimerKind::Reclaim);
             return;
         }
-        if self.text_offer && !self.text.is_empty() {
-            log("wfica probe empty during text offer; restoring CLIPBOARD");
-            self.import_pending = false;
-            self.pull = None;
-            self.session_pull_done = true;
-            self.pulled_owner_xid = pull.owner;
-            self.schedule(Duration::from_millis(40), self.ingest_seq, TimerKind::Reclaim);
-            return;
-        }
         let next = match pull.stage {
             PullStage::Isl => Some(PullStage::Dib),
             PullStage::Dib => Some(PullStage::CfDib),
             PullStage::CfDib => Some(PullStage::ImageBmp),
             PullStage::ImageBmp => Some(PullStage::ImagePng),
-            PullStage::ImagePng => None,
+            PullStage::ImagePng | PullStage::Targets | PullStage::Text => None,
         };
         if let Some(stage) = next {
             self.start_pull(pull.owner, stage);
@@ -1176,51 +1160,34 @@ impl Bridge {
     fn pull_done(&mut self, pull: Pull, img: Option<(Vec<u8>, u32, u32)>) {
         self.import_pending = false;
         self.pull = None;
+        self.pull_cool_until = Some(Instant::now() + Duration::from_secs(1));
         match img {
             Some((rgb, w, h)) => {
-                self.pulled_owner_xid = pull.owner;
-                self.wfica_pull_tries = 0;
-                self.pull_cool_until = Some(Instant::now() + Duration::from_secs(1));
                 log(&format!("pull {:?} {w}x{h}", pull.stage));
-                self.publish_session_image(rgb, w, h);
+                self.capture_session_image(pull.owner, rgb, w, h);
             }
             None => {
-                self.wfica_pull_tries += 1;
-                let delay = if self.wfica_pull_tries >= 3 { 8 } else { 1 };
-                self.pull_cool_until =
-                    Some(Instant::now() + Duration::from_millis(delay * 1500));
-                if self.wfica_pull_tries >= 3 {
-                    self.pulled_owner_xid = pull.owner;
-                    self.session_pull_done = true;
-                    log("pull empty; stop until clipboard owner changes");
-                } else {
-                    log("pull empty; retry later");
-                }
+                log("pull empty; session copy not captured");
+                self.session_capture_done(pull.owner, None);
             }
         }
     }
 
     /// Citrix -> Wayland. Do not steal X11 from wfica.
-    fn publish_session_image(&mut self, rgb: Vec<u8>, w: u32, h: u32) {
+    fn capture_session_image(&mut self, owner: Window, rgb: Vec<u8>, w: u32, h: u32) {
         let Some(png) = dib::png_encode(&rgb, w, h) else {
+            self.session_capture_done(owner, None);
             return;
         };
-        let hash = hash_bytes(&png);
-        if hash == self.last_hash {
-            self.session_pull_done = true;
-            return;
-        }
-        self.last_hash = hash;
+        self.last_hash = hash_bytes(&png);
         self.dib = dib::rgb_to_isl_dib(&rgb, w, h);
-        wl_copy_png(png.clone());
-        self.png = png;
+        self.png = png.clone();
         self.img_w = w;
         self.img_h = h;
         self.reassert_left = 0;
-        self.session_pull_done = true;
         self.host_offer = false;
-        self.last_export_at = Some(Instant::now());
-        log(&format!("exported session image {w}x{h} to Wayland"));
+        log(&format!("captured session image {w}x{h}"));
+        self.session_capture_done(owner, Some(SessionExport::Png(png)));
     }
 
     // ---- Wayland ingest ------------------------------------------------
@@ -1229,21 +1196,18 @@ impl Bridge {
         // Prefer bytes written by `--ingest` (stdin from wl-paste --type …);
         // otherwise probe the Wayland clipboard for any common image MIME
         // (clipboard-changed watch fires for text too — ignore those).
-        let bytes = fs::read(png_path())
-            .ok()
-            .filter(|b| !b.is_empty())
-            .or_else(fetch_wayland_image);
-        let Some(png) = bytes else {
-            // Text-only Wayland clipboard: own X11 CLIPBOARD and serve UTF-8.
-            // Relying on KWin alone leaves owner=None often enough that Citrix
-            // paste needs several copy retries.
-            if wayland_clipboard_is_text_only() {
-                if let Some(text) = fetch_wayland_text() {
-                    self.claim_for_text(text);
-                }
-            } else {
-                log("clipboard changed; no Wayland image MIME found");
-            }
+        let file = fs::read(png_path()).ok().filter(|b| !b.is_empty());
+        let _ = fs::remove_file(png_path());
+        // KWin mirroring an X11 owner onto Wayland: a session copy (handled by
+        // on_session_copy) or our own offer. Reading the latter back with
+        // wl-paste would block on ourselves until KWin times out.
+        let owner = self.selection_owner(self.atoms.clipboard);
+        if owner == self.holder || self.window_is_wfica(owner) {
+            return;
+        }
+        // Text needs no bridge: KWin pushes the Wayland selection onto X11
+        // whenever wfica gains focus.
+        let Some(png) = file.or_else(fetch_wayland_image) else {
             return;
         };
         if !self.wfica_running() {
@@ -1259,7 +1223,7 @@ impl Bridge {
         // *new* Wayland selection, so a silent return here also hides
         // "user re-copied the same screenshot" when ownership was lost.
         if hash == self.last_hash {
-            if !self.dib.is_empty() && !self.we_own(self.atoms.clipboard) {
+            if self.host_offer && !self.dib.is_empty() && !self.we_own(self.atoms.clipboard) {
                 log("reingest same png; CLIPBOARD not owned, re-claiming");
                 self.claim_for_citrix("reingest");
             }
@@ -1305,7 +1269,6 @@ impl Bridge {
         self.last_ingest_at = Some(Instant::now());
         self.pull_cool_until = Some(Instant::now() + Duration::from_secs(2));
         self.pulled_owner_xid = 0;
-        self.wfica_pull_tries = 0;
         // Prefer host offer over session pull until a real session image arrives.
         self.session_pull_done = true;
         // claim_for_citrix sets pending_serve / ingest_seq / host_offer.
@@ -1326,8 +1289,7 @@ impl Bridge {
         if ev.subtype != xfixes::SelectionEvent::SET_SELECTION_OWNER {
             if xid == NONE {
                 self.last_clip_owner = NONE;
-                if (self.host_offer && !self.dib.is_empty())
-                    || (self.text_offer && !self.text.is_empty())
+                if self.host_offer && !self.dib.is_empty()
                 {
                     self.schedule(Duration::from_millis(40), self.ingest_seq, TimerKind::Reclaim);
                 }
@@ -1340,8 +1302,7 @@ impl Bridge {
             return;
         }
         if xid == NONE {
-            if (self.host_offer && !self.dib.is_empty())
-                || (self.text_offer && !self.text.is_empty())
+            if self.host_offer && !self.dib.is_empty()
             {
                 self.schedule(Duration::from_millis(40), self.ingest_seq, TimerKind::Reclaim);
             }
@@ -1350,60 +1311,27 @@ impl Bridge {
         if !self.session_active || !self.window_is_wfica(xid) {
             return;
         }
-        // Host image/text cached: wfica grabbing CLIPBOARD is usually paste.
-        // For images, probe _ISL_DIB once; on refuse restore the host offer.
-        // For text, just reclaim — do not image-pull-storm.
-        if self.host_offer && !self.dib.is_empty() {
-            if !same_owner {
-                log("xfixes: wfica took CLIPBOARD during host offer; probe _ISL_DIB");
-            }
-            self.pull_time = if ev.selection_timestamp != 0 {
-                ev.selection_timestamp
-            } else {
-                ev.timestamp
-            };
-            self.session_pull_done = false;
-            self.pulled_owner_xid = 0;
-            self.wfica_pull_tries = 0;
-            self.start_pull(xid, PullStage::Isl);
-            return;
-        }
-        if self.text_offer && !self.text.is_empty() {
-            if !same_owner {
-                log("xfixes: wfica took CLIPBOARD during text offer; reclaim later");
-            }
-            self.session_pull_done = true;
-            self.schedule(Duration::from_millis(80), self.ingest_seq, TimerKind::Reclaim);
-            return;
-        }
-        // Skip pulling back the image we just pushed into Citrix. wfica often
-        // re-claims CLIPBOARD after ConvertSelection'_ISL_DIB; treating that as
-        // a new session copy starts an empty-pull storm.
-        if self
-            .last_ingest_at
-            .is_some_and(|t| t.elapsed() < Duration::from_secs(20))
-        {
-            if !same_owner {
-                log("xfixes after Wayland ingest; skip pull");
-            }
-            self.session_pull_done = true;
-            return;
-        }
-        // wfica keeps the same CLIPBOARD owner window across copies. Ignoring
-        // same-xid re-asserts left session_pull_done stuck after empty pulls,
-        // so later image copies from the session never reached Wayland.
-        self.session_pull_done = false;
-        self.pulled_owner_xid = 0;
-        self.wfica_pull_tries = 0;
         self.pull_time = if ev.selection_timestamp != 0 {
             ev.selection_timestamp
         } else {
             ev.timestamp
         };
-        if same_owner {
-            log(&format!("wfica re-asserted CLIPBOARD 0x{xid:x}; repull"));
+        // Citrix grabbed CLIPBOARD before fetching our DIB: probe _ISL_DIB
+        // once; on refuse pull_failed restores the host offer.
+        if self.host_offer && self.pending_serve && !self.dib.is_empty() {
+            log("xfixes: wfica took CLIPBOARD during host offer; probe _ISL_DIB");
+            self.session_pull_done = false;
+            self.pulled_owner_xid = 0;
+            self.start_pull(xid, PullStage::Isl);
+            return;
         }
-        self.request_wfica_image();
+        // wfica keeps the same owner window across copies; every SetSelectionOwner
+        // from it is a new session copy.
+        log(&format!(
+            "xfixes: wfica {} CLIPBOARD 0x{xid:x} (session copy)",
+            if same_owner { "re-asserted" } else { "took" }
+        ));
+        self.on_session_copy(xid);
     }
 
     fn handle_event(&mut self, ev: Event) {
@@ -1452,10 +1380,9 @@ impl Bridge {
     }
 }
 
-fn wl_copy_png(png: Vec<u8>) {
+fn wl_copy(args: &[&str], data: Vec<u8>) {
     let mut cmd = Command::new("wl-copy");
-    cmd.arg("--type")
-        .arg("image/png")
+    cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -1470,7 +1397,7 @@ fn wl_copy_png(png: Vec<u8>) {
     // background. Write + reap on a thread so the event loop never blocks.
     std::thread::spawn(move || {
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(&png);
+            let _ = stdin.write_all(&data);
         }
         let _ = child.wait();
     });
@@ -1567,56 +1494,6 @@ fn notify_daemon() {
     }
 }
 
-/// Read UTF-8 text from the Wayland clipboard.
-fn fetch_wayland_text() -> Option<Vec<u8>> {
-    let out = Command::new("wl-paste")
-        .args(["--type", "text/plain;charset=utf-8"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success() && !o.stdout.is_empty())
-        .or_else(|| {
-            Command::new("wl-paste")
-                .args(["--type", "text/plain"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .output()
-                .ok()
-                .filter(|o| o.status.success() && !o.stdout.is_empty())
-        })?;
-    Some(out.stdout)
-}
-
-/// True when Wayland CLIPBOARD is text and has no image/* type. Used to
-/// decide whether to yield X11 CLIPBOARD ownership back to KWin.
-fn wayland_clipboard_is_text_only() -> bool {
-    let Ok(out) = Command::new("wl-paste")
-        .arg("--list-types")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-    else {
-        return false;
-    };
-    if !out.status.success() || out.stdout.is_empty() {
-        return false;
-    }
-    let types = String::from_utf8_lossy(&out.stdout);
-    let has_image = types.lines().any(|l| l.starts_with("image/"));
-    let has_text = types.lines().any(|l| {
-        l.starts_with("text/")
-            || l == "UTF8_STRING"
-            || l == "STRING"
-            || l == "TEXT"
-            || l == "COMPOUND_TEXT"
-    });
-    has_text && !has_image
-}
-
 /// Probe Wayland for any image MIME Citrix might need. Used when the
 /// untyped `wl-paste --watch` fires (covers jpeg/webp/bmp, not just png).
 fn fetch_wayland_image() -> Option<Vec<u8>> {
@@ -1631,8 +1508,10 @@ fn fetch_wayland_image() -> Option<Vec<u8>> {
         "image/x-MS-bmp",
     ];
     for mime in MIMES {
-        let out = Command::new("wl-paste")
-            .args(["--type", mime])
+        // The event loop is blocked while this runs; if the Wayland source is
+        // an X11 client that never answers, give up instead of hanging.
+        let out = Command::new("timeout")
+            .args(["2", "wl-paste", "--type", mime])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1643,8 +1522,6 @@ fn fetch_wayland_image() -> Option<Vec<u8>> {
                     "wayland has {mime} ({} bytes)",
                     o.stdout.len()
                 ));
-                // Cache for ingest_png's file-first path.
-                let _ = fs::write(png_path(), &o.stdout);
                 return Some(o.stdout);
             }
             _ => {}
@@ -1780,7 +1657,7 @@ fn run_loop(br: &mut Bridge, notify_fd: RawFd) -> i32 {
             br.poll_wfica_export();
         }
         if now >= next_focus {
-            next_focus = now + Duration::from_millis(300);
+            next_focus = now + Duration::from_millis(100);
             br.poll_focus();
         }
         if br.pull.as_ref().is_some_and(|p| now >= p.deadline) {
@@ -1922,12 +1799,10 @@ fn daemon_mode(foreground: bool) -> i32 {
     let mut br = Bridge {
         conn,
         holder,
-        root,
         atoms,
         max_prop,
         dib: Vec::new(),
         png: Vec::new(),
-        text: Vec::new(),
         img_w: 0,
         img_h: 0,
         last_hash: 0,
@@ -1938,12 +1813,10 @@ fn daemon_mode(foreground: bool) -> i32 {
         reassert_left: 0,
         ingest_seq: 0,
         pulled_owner_xid: 0,
-        wfica_pull_tries: 0,
         last_ingest_at: None,
         last_export_at: None,
         pull_cool_until: None,
         host_offer: false,
-        text_offer: false,
         last_clip_owner: 0,
         last_x_time: 0,
         owned_at: 0,
@@ -1951,6 +1824,8 @@ fn daemon_mode(foreground: bool) -> i32 {
         wfica_focused: false,
         wfica_cache: None,
         focus_cache: None,
+        wfica_xids: HashMap::new(),
+        session_export: None,
         pull: None,
         timers: Vec::new(),
     };
