@@ -43,7 +43,8 @@ Packaged `wfclient.ini` uses:
 
 - `KeyboardLayout=French`
 - `KeyboardEventMode=Scancode` (needed for Ctrl+C / Ctrl+V inside MSTSC)
-- `KeyboardSyncMode=Once`
+- `KeyboardSyncMode=Dynamic` (with `Once`, an MSTSC relaunched into an
+  already-running session started on the Windows default US layout)
 - `UseEUKS=2`, `UseEUKSforASCII=True`, `KeyboardSendLocale=True`
 - `MouseSendsControlV=False`
 

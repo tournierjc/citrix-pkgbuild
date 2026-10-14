@@ -29,7 +29,7 @@ section = "[Virtual Channels\\Keyboard]"
 updates = {
     "KeyboardLayout": "French",
     "KeyboardEventMode": "Scancode",
-    "KeyboardSyncMode": "Once",
+    "KeyboardSyncMode": "Dynamic",
     "KeyboardMappingFile": "automatic.kbd",
     "KeyboardSendLocale": "True",
     "UseEUKS": "2",

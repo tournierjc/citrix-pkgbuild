@@ -1,6 +1,6 @@
 pkgname=icaclient-bin
 pkgver=26.04.10.1
-pkgrel=34
+pkgrel=35
 pkgdesc="Citrix ICA Client (repackaged vendor RPM, no compilation)"
 arch=('x86_64')
 url="https://www.citrix.com/downloads/workspace-app/linux/workspace-app-for-linux-latest.html"
@@ -117,7 +117,7 @@ KeyboardType=(Default)
 KeyboardMappingFile = automatic.kbd
 KeyboardDescription = French
 KeyboardEventMode = Scancode
-KeyboardSyncMode = Once
+KeyboardSyncMode = Dynamic
 UseEUKS=2
 UseEUKSforASCII=True
 KeyboardSendLocale=True
@@ -140,7 +140,7 @@ EOF
       -e 's/^KeyboardMappingFile *=.*/KeyboardMappingFile = automatic.kbd/' \
       -e 's/^KeyboardDescription *=.*/KeyboardDescription = French/' \
       -e 's/^KeyboardEventMode *=.*/KeyboardEventMode = Scancode/' \
-      -e 's/^KeyboardSyncMode *=.*/KeyboardSyncMode = Once/' \
+      -e 's/^KeyboardSyncMode *=.*/KeyboardSyncMode = Dynamic/' \
       -e 's/^UseEUKS *=.*/UseEUKS=2/' \
       -e 's/^UseEUKSforASCII *=.*/UseEUKSforASCII=True/' \
       -e 's/^KeyboardSendLocale *=.*/KeyboardSendLocale=True/' \
@@ -215,7 +215,7 @@ PY
     # QWERTY onto nested MSTSC / Winlogon. Pin the AZERTY scancode + EUKS path.
     _ini_set "$ini" 'Virtual Channels\Keyboard' KeyboardLayout French
     _ini_set "$ini" 'Virtual Channels\Keyboard' KeyboardEventMode Scancode
-    _ini_set "$ini" 'Virtual Channels\Keyboard' KeyboardSyncMode Once
+    _ini_set "$ini" 'Virtual Channels\Keyboard' KeyboardSyncMode Dynamic
     _ini_set "$ini" 'Virtual Channels\Keyboard' KeyboardMappingFile automatic.kbd
     _ini_set "$ini" 'Virtual Channels\Keyboard' KeyboardSendLocale True
     _ini_set "$ini" 'Virtual Channels\Keyboard' UseEUKS 2
