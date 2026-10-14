@@ -227,6 +227,7 @@ struct Bridge {
     /// into Citrix) and keep re-offering our DIB instead of pull-storming.
     host_offer: bool,
     last_clip_owner: Window,
+    wfica_took_at: Option<Instant>,
     /// Last non-zero X server timestamp observed (SelectionRequest / XFixes / …).
     /// wfica is picky: ConvertSelection/SetSelectionOwner with CurrentTime often
     /// returns property=None or never answers, while GTK's server time works.
@@ -1201,13 +1202,29 @@ impl Bridge {
         // KWin mirroring an X11 owner onto Wayland: a session copy (handled by
         // on_session_copy) or our own offer. Reading the latter back with
         // wl-paste would block on ourselves until KWin times out.
+        // wfica stays the X11 owner while Linux apps copy (KWin only syncs
+        // Wayland onto X11 while wfica is focused), so only a fresh take counts.
         let owner = self.selection_owner(self.atoms.clipboard);
-        if owner == self.holder || self.window_is_wfica(owner) {
+        if owner == self.holder
+            || (self.wfica_took_at.is_some_and(|t| t.elapsed() < Duration::from_millis(1500))
+                && self.window_is_wfica(owner))
+        {
             return;
         }
         // Text needs no bridge: KWin pushes the Wayland selection onto X11
-        // whenever wfica gains focus.
+        // whenever wfica gains focus. Drop any cached DIB so focus changes do
+        // not push a stale image over it.
         let Some(png) = file.or_else(fetch_wayland_image) else {
+            if self.host_offer {
+                log("Wayland clipboard has no image; dropped cached DIB");
+                self.host_offer = false;
+                self.pending_serve = false;
+                self.reassert_left = 0;
+                self.ingest_seq += 1;
+                self.dib.clear();
+                self.png.clear();
+                self.last_hash = 0;
+            }
             return;
         };
         if !self.wfica_running() {
@@ -1316,6 +1333,7 @@ impl Bridge {
         } else {
             ev.timestamp
         };
+        self.wfica_took_at = Some(Instant::now());
         // Citrix grabbed CLIPBOARD before fetching our DIB: probe _ISL_DIB
         // once; on refuse pull_failed restores the host offer.
         if self.host_offer && self.pending_serve && !self.dib.is_empty() {
@@ -1818,6 +1836,7 @@ fn daemon_mode(foreground: bool) -> i32 {
         pull_cool_until: None,
         host_offer: false,
         last_clip_owner: 0,
+        wfica_took_at: None,
         last_x_time: 0,
         owned_at: 0,
         pull_time: 0,
