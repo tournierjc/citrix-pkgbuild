@@ -66,8 +66,8 @@ Plasma copies screenshots as Wayland `image/png`. `wfica` only imports X11
 
 - watches Wayland `image/png` (`wl-paste --watch`) and caches a Citrix DIB
 - mirrors the last Wayland text and serves it as `UTF8_STRING`,
-  `text/plain;charset=utf-8`, `text/plain`, `TEXT` and `STRING` whenever it
-  owns `CLIPBOARD`
+  `COMPOUND_TEXT` (wfica's first text target on paste), `text/plain;charset=utf-8`,
+  `text/plain`, `TEXT` and `STRING` whenever it owns `CLIPBOARD`
 - while a Citrix window is focused, owns X11 `CLIPBOARD` and offers
   `_ISL_DIB` (32bpp, pixels at offset `0x428`, one-shot `XChangeProperty`
   with BIG-REQUESTS)

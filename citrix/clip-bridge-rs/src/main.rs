@@ -128,6 +128,7 @@ struct Atoms {
     text: Atom,
     text_plain: Atom,
     text_plain_utf8: Atom,
+    compound_text: Atom,
     wm_class: Atom,
     pull_prop: Atom,
     incr: Atom,
@@ -153,6 +154,8 @@ fn intern_atoms(conn: &RustConnection) -> Result<Atoms, Box<dyn std::error::Erro
         text: get(b"TEXT")?,
         text_plain: get(b"text/plain")?,
         text_plain_utf8: get(b"text/plain;charset=utf-8")?,
+        // wfica's first text target on paste is COMPOUND_TEXT, not UTF8_STRING.
+        compound_text: get(b"COMPOUND_TEXT")?,
         wm_class: get(b"WM_CLASS")?,
         pull_prop: get(b"CITRIX_CLIP_BRIDGE_PULL")?,
         incr: get(b"INCR")?,
@@ -751,6 +754,7 @@ impl Bridge {
                 // last Wayland text next to the image instead of refusing it.
                 list.extend_from_slice(&[
                     a.utf8_string,
+                    a.compound_text,
                     a.text_plain_utf8,
                     a.text_plain,
                     a.text,
@@ -789,14 +793,17 @@ impl Bridge {
             }
             return;
         }
-        if t == AtomEnum::STRING.into() {
+        if t == AtomEnum::STRING.into() || t == a.compound_text {
             if self.text.is_empty() {
                 self.refuse(&ev);
             } else {
+                // STRING/COMPOUND_TEXT are pre-UTF-8: latin-1 keeps ASCII exact
+                // and never emits invalid UTF-8, which wfica treats as garbage.
                 let payload = to_latin1(&self.text);
                 let n = payload.len();
+                let name = self.target_name(t);
                 if self.answer(&ev, prop, t, &payload, 8) {
-                    log(&format!("served STRING {n} bytes"));
+                    log(&format!("served {name} {n} bytes"));
                 }
             }
             return;
