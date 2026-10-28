@@ -13,6 +13,8 @@
 //! - INCR receiving is implemented for the Citrix -> Wayland pull
 //! - PIXMAP is not advertised (wfica picks _ISL_DIB); TIMESTAMP is advertised
 //!   (ICCCM; GTK served it implicitly, which Citrix awaits after TARGETS)
+//! - text (UTF8_STRING / STRING / TEXT / text/plain) is served from the last
+//!   Wayland text, so owning CLIPBOARD never breaks paste into the session
 //! - uses XFixes/SelectionRequest timestamps (not CurrentTime) for
 //!   ConvertSelection / SetSelectionOwner; same-xid wfica re-asserts repull
 
@@ -208,6 +210,10 @@ struct Bridge {
 
     dib: Vec<u8>,
     png: Vec<u8>,
+    /// Last text payload mirrored from the Wayland selection. Owned CLIPBOARD
+    /// must stay usable for text paste into the session, so it is served next
+    /// to the image targets instead of being refused.
+    text: Vec<u8>,
     img_w: u32,
     img_h: u32,
     last_hash: u64,
@@ -520,6 +526,12 @@ impl Bridge {
         if xid != NONE && self.window_is_wfica(xid) && !self.pending_serve {
             return;
         }
+        // A live non-wfica owner (XWayland/KWin) holds the current Wayland
+        // selection, usually the text the user just copied. Leave it alone
+        // unless wfica is still waiting for our DIB.
+        if xid != NONE && !self.window_is_wfica(xid) && !self.pending_serve {
+            return;
+        }
         self.offer_selections();
         if xid == NONE {
             log("restored CLIPBOARD offer (was unowned)");
@@ -723,16 +735,28 @@ impl Bridge {
             // Prefer Citrix formats first. Keep image/png out of TARGETS
             // while bridging to Citrix: advertising it makes XWayland
             // ConvertSelection then steal CLIPBOARD ownership.
-            let list = [
-                a.targets,
-                a.timestamp,
-                a.isl_dib,
-                a.dib,
-                a.cf_dib,
-                a.rgbquad,
-                a.image_bmp,
-                a.bmp,
-            ];
+            let mut list = vec![a.targets, a.timestamp];
+            if !self.dib.is_empty() {
+                list.extend_from_slice(&[
+                    a.isl_dib,
+                    a.dib,
+                    a.cf_dib,
+                    a.rgbquad,
+                    a.image_bmp,
+                    a.bmp,
+                ]);
+            }
+            if !self.text.is_empty() {
+                // Owning CLIPBOARD must never hide text from wfica: offer the
+                // last Wayland text next to the image instead of refusing it.
+                list.extend_from_slice(&[
+                    a.utf8_string,
+                    a.text_plain_utf8,
+                    a.text_plain,
+                    a.text,
+                    AtomEnum::STRING.into(),
+                ]);
+            }
             let mut data = Vec::with_capacity(list.len() * 4);
             for at in list {
                 data.extend_from_slice(&at.to_le_bytes());
@@ -749,6 +773,32 @@ impl Bridge {
                 ev.time
             };
             self.answer(&ev, prop, AtomEnum::INTEGER.into(), &ts.to_le_bytes(), 32);
+            return;
+        }
+        // Text goes straight through: while we own CLIPBOARD, wfica's Ctrl+V
+        // converts UTF8_STRING/STRING and used to get property=None.
+        if t == a.utf8_string || t == a.text_plain_utf8 || t == a.text_plain || t == a.text {
+            if self.text.is_empty() {
+                self.refuse(&ev);
+            } else {
+                let n = self.text.len();
+                let name = self.target_name(t);
+                if self.answer(&ev, prop, t, &self.text, 8) {
+                    log(&format!("served {name} {n} bytes"));
+                }
+            }
+            return;
+        }
+        if t == AtomEnum::STRING.into() {
+            if self.text.is_empty() {
+                self.refuse(&ev);
+            } else {
+                let payload = to_latin1(&self.text);
+                let n = payload.len();
+                if self.answer(&ev, prop, t, &payload, 8) {
+                    log(&format!("served STRING {n} bytes"));
+                }
+            }
             return;
         }
         if t == a.image_png || t == a.png {
@@ -815,9 +865,12 @@ impl Bridge {
             }
             return;
         }
-        // Lost CLIPBOARD to XWayland / cleared owner. Re-offer so a later
-        // paste into Citrix still finds our payload.
-        if self.host_offer && !self.dib.is_empty() {
+        // Lost CLIPBOARD to XWayland / cleared owner. Re-offer only when the
+        // selection ended up unowned: a live non-wfica owner (KWin mirroring
+        // the Wayland selection) is the text the user just copied, and
+        // stealing it back is what swallowed text paste.
+        let owner = self.selection_owner(self.atoms.clipboard);
+        if owner == NONE && self.host_offer && !self.dib.is_empty() {
             self.schedule(Duration::from_millis(40), self.ingest_seq, TimerKind::Reclaim);
         }
     }
@@ -1215,6 +1268,13 @@ impl Bridge {
         // whenever wfica gains focus. Drop any cached DIB so focus changes do
         // not push a stale image over it.
         let Some(png) = file.or_else(fetch_wayland_image) else {
+            // Not an image: mirror the text so a paste into Citrix still finds
+            // a payload while we own CLIPBOARD, and stop offering the DIB.
+            let text = fetch_wayland_text();
+            self.text = text.unwrap_or_default();
+            if !self.text.is_empty() {
+                log(&format!("cached Wayland text ({} bytes)", self.text.len()));
+            }
             if self.host_offer {
                 log("Wayland clipboard has no image; dropped cached DIB");
                 self.host_offer = false;
@@ -1225,8 +1285,13 @@ impl Bridge {
                 self.png.clear();
                 self.last_hash = 0;
             }
+            if self.text.is_empty() && self.dib.is_empty() && self.we_own(self.atoms.clipboard) {
+                self.release_selections();
+                log("released CLIPBOARD (nothing left to serve)");
+            }
             return;
         };
+        self.text.clear();
         if !self.wfica_running() {
             self.set_session_active(false, "ingest");
             return;
@@ -1548,6 +1613,35 @@ fn fetch_wayland_image() -> Option<Vec<u8>> {
     None
 }
 
+/// Read the Wayland selection as text. Called when a clipboard change turns
+/// out not to carry an image, so an owned CLIPBOARD can still serve text.
+fn fetch_wayland_text() -> Option<Vec<u8>> {
+    let out = Command::new("timeout")
+        .args(["2", "wl-paste", "--no-newline"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if out.status.success() && !out.stdout.is_empty() {
+        Some(out.stdout)
+    } else {
+        None
+    }
+}
+
+/// Best-effort UTF-8 -> ISO-8859-1 for the ICCCM STRING target, which predates
+/// UTF-8. Latin-1 characters map 1:1, everything else becomes '?'.
+fn to_latin1(data: &[u8]) -> Vec<u8> {
+    match std::str::from_utf8(data) {
+        Ok(s) => s
+            .chars()
+            .map(|c| if (c as u32) < 0x100 { c as u8 } else { b'?' })
+            .collect(),
+        Err(_) => data.to_vec(),
+    }
+}
+
 /// wl-paste --watch without --type: any clipboard change. Drain stdin
 /// (often text) and poke the daemon to probe image MIME types.
 fn clipboard_changed_mode() -> i32 {
@@ -1821,6 +1915,7 @@ fn daemon_mode(foreground: bool) -> i32 {
         max_prop,
         dib: Vec::new(),
         png: Vec::new(),
+        text: Vec::new(),
         img_w: 0,
         img_h: 0,
         last_hash: 0,

@@ -65,6 +65,9 @@ Plasma copies screenshots as Wayland `image/png`. `wfica` only imports X11
 `citrix-clip-bridge` is still installed as a fallback):
 
 - watches Wayland `image/png` (`wl-paste --watch`) and caches a Citrix DIB
+- mirrors the last Wayland text and serves it as `UTF8_STRING`,
+  `text/plain;charset=utf-8`, `text/plain`, `TEXT` and `STRING` whenever it
+  owns `CLIPBOARD`
 - while a Citrix window is focused, owns X11 `CLIPBOARD` and offers
   `_ISL_DIB` (32bpp, pixels at offset `0x428`, one-shot `XChangeProperty`
   with BIG-REQUESTS)
@@ -72,16 +75,23 @@ Plasma copies screenshots as Wayland `image/png`. `wfica` only imports X11
 - when you copy in the session, reads the text (or `_ISL_DIB` image) straight
   from `wfica`, keeps the Wayland clipboard empty while Citrix stays focused,
   and publishes the copy with `wl-copy` once focus leaves Citrix
-
-Linux → Citrix text needs no bridge: KWin pushes the Wayland clipboard onto
-X11 whenever a Citrix window gains focus. The empty-while-focused rule works
-around a KWin race: on each new session copy `wfica` drops X11 `CLIPBOARD`
-for a moment before re-taking it, KWin fills that gap with its stale copy of
-the previous clipboard, and `wfica` then replaces the session clipboard with
-it (a Ctrl+C in Citrix seemed to need pressing twice).
 - downscales images above the X11 BIG-REQUESTS limit (~16 MB, e.g. a
   full-screen 4K capture becomes ~2730x1535) so the paste still works;
   wfica cannot reassemble INCR chunks, so chunking is not an option
+
+Owning `CLIPBOARD` is exclusive, so the bridge serves text itself instead of
+relying on KWin: as long as an image offer is live, `Ctrl+V` in the session is
+answered by the daemon, and an image-only target list made it return nothing
+for text. It now advertises text targets next to the image ones, only lists
+formats whose cache is non-empty, releases `CLIPBOARD` once neither a text nor
+an image payload is left, and never steals the selection back from
+KWin/XWayland while that selection is live (it only reclaims an unowned one).
+
+The empty-while-focused rule works around a KWin race: on each new session copy
+`wfica` drops X11 `CLIPBOARD` for a moment before re-taking it, KWin fills that
+gap with its stale copy of the previous clipboard, and `wfica` then replaces
+the session clipboard with it (a Ctrl+C in Citrix seemed to need pressing
+twice).
 
 It is a **user systemd service** and starts with the graphical session, but
 it stays idle until a `wfica` process is running. Copy/paste on the host is
