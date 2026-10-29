@@ -780,23 +780,19 @@ impl Bridge {
             return;
         }
         // Text goes straight through: while we own CLIPBOARD, wfica's Ctrl+V
-        // converts UTF8_STRING/STRING and used to get property=None.
+        // converts UTF8_STRING/STRING and used to get property=None. A refusal
+        // here is what wedges VDCLIP for the whole session (BadAtom loop), so
+        // every text target is answered, even with an empty payload.
         if t == a.utf8_string || t == a.text_plain_utf8 || t == a.text_plain || t == a.text {
-            if self.text.is_empty() {
-                self.refuse(&ev);
-            } else {
-                let n = self.text.len();
-                let name = self.target_name(t);
-                if self.answer(&ev, prop, t, &self.text, 8) {
-                    log(&format!("served {name} {n} bytes"));
-                }
+            let n = self.text.len();
+            let name = self.target_name(t);
+            if self.answer(&ev, prop, t, &self.text, 8) {
+                log(&format!("served {name} {n} bytes"));
             }
             return;
         }
         if t == AtomEnum::STRING.into() || t == a.compound_text {
-            if self.text.is_empty() {
-                self.refuse(&ev);
-            } else {
+            {
                 // STRING/COMPOUND_TEXT are pre-UTF-8: latin-1 keeps ASCII exact
                 // and never emits invalid UTF-8, which wfica treats as garbage.
                 let payload = to_latin1(&self.text);
@@ -1298,7 +1294,10 @@ impl Bridge {
             }
             return;
         };
-        self.text.clear();
+        // Keep the previous text on purpose: while we own CLIPBOARD, wfica asks
+        // text targets too, and answering them (even with the older text) is
+        // what keeps VDCLIP healthy. Clearing it made those conversions fail
+        // and wedged the client into its BadAtom loop.
         if !self.wfica_running() {
             self.set_session_active(false, "ingest");
             return;

@@ -87,6 +87,13 @@ formats whose cache is non-empty, releases `CLIPBOARD` once neither a text nor
 an image payload is left, and never steals the selection back from
 KWin/XWayland while that selection is live (it only reclaims an unowned one).
 
+Text conversions are **never refused**, even with an empty payload: `wfica`
+answers a refused `STRING`/`COMPOUND_TEXT` conversion by wedging its VDCLIP
+channel (`ConvertSelection` with `target=0` → `BadAtom` every 5 s), and from
+then on nothing can be pasted into the session until the client process is
+killed and relaunched. The last text is deliberately kept when an image is
+ingested so those conversions always have a payload.
+
 The empty-while-focused rule works around a KWin race: on each new session copy
 `wfica` drops X11 `CLIPBOARD` for a moment before re-taking it, KWin fills that
 gap with its stale copy of the previous clipboard, and `wfica` then replaces
