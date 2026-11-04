@@ -215,7 +215,9 @@ struct Bridge {
     png: Vec<u8>,
     /// Last text payload mirrored from the Wayland selection. Owned CLIPBOARD
     /// must stay usable for text paste into the session, so it is served next
-    /// to the image targets instead of being refused.
+    /// to the image targets instead of being refused. An image stays cached
+    /// while a later clipboard event still carries this same text: that is
+    /// KWin echoing the previous selection after we release CLIPBOARD.
     text: Vec<u8>,
     img_w: u32,
     img_h: u32,
@@ -235,6 +237,11 @@ struct Bridge {
     /// session image. While set, ignore empty wfica CLIPBOARD grabs (paste
     /// into Citrix) and keep re-offering our DIB instead of pull-storming.
     host_offer: bool,
+    /// Set when we SetSelectionOwner(None) on CLIPBOARD we owned.
+    released_at: Option<Instant>,
+    /// wfica has sent SelectionRequest for this offer. Releasing CLIPBOARD
+    /// after that races the C2H render (mstsc paste → WFCLIP_RENDER_REPLY).
+    serve_seen: bool,
     last_clip_owner: Window,
     wfica_took_at: Option<Instant>,
     /// Last non-zero X server timestamp observed (SelectionRequest / XFixes / …).
@@ -415,13 +422,14 @@ impl Bridge {
     /// PRIMARY (Linux middle-click) and never clear a selection we do not
     /// own: SetSelectionOwner(None) as a third party can unown the host
     /// clipboard.
-    fn release_selections(&self) {
+    fn release_selections(&mut self) {
         if self.selection_owner(self.atoms.clipboard) == self.holder {
             let t = if self.last_x_time != 0 { self.last_x_time } else { CURRENT_TIME };
             let _ = self
                 .conn
                 .set_selection_owner(NONE, self.atoms.clipboard, t);
             let _ = self.conn.flush();
+            self.released_at = Some(Instant::now());
         }
     }
 
@@ -452,6 +460,7 @@ impl Bridge {
     fn drop_clipboard_ownership(&mut self) {
         self.reassert_left = 0;
         self.pending_serve = false;
+        self.serve_seen = false;
         self.host_offer = false;
         self.ingest_seq += 1;
         self.dib.clear();
@@ -467,6 +476,7 @@ impl Bridge {
         }
         self.host_offer = true;
         self.pending_serve = true;
+        self.serve_seen = false;
         if !self.wfica_focused {
             self.reassert_left = 0;
             self.ingest_seq += 1;
@@ -551,6 +561,7 @@ impl Bridge {
             || !self.wfica_focused
             || seq != self.ingest_seq
             || !self.pending_serve
+            || self.serve_seen
             || self.dib.is_empty()
         {
             return;
@@ -718,6 +729,10 @@ impl Bridge {
         if t != a.targets {
             log(&format!("selection-request {}", self.target_name(t)));
         }
+        // wfica is reading this offer. A later poke must not SetSelectionOwner
+        // (None): mstsc paste is a delayed render, and losing CLIPBOARD mid
+        // ConvertSelection makes wfica answer WFCLIP_RENDER_REPLY failure.
+        self.serve_seen = true;
         // Citrix ConvertSelection is in progress. Stop reclaiming CLIPBOARD
         // or we race the C2H render and paste into the session fails.
         if [
@@ -850,7 +865,10 @@ impl Bridge {
                 self.refuse(&ev);
             } else {
                 let payload = dib::wrap_bmp(&dib::as_cf_dib(&self.dib));
-                self.answer(&ev, prop, t, &payload, 8);
+                let n = payload.len();
+                if self.answer(&ev, prop, t, &payload, 8) {
+                    log(&format!("served image/bmp {n} bytes"));
+                }
             }
             return;
         }
@@ -980,6 +998,7 @@ impl Bridge {
         match self.session_export.take() {
             Some(SessionExport::Text(text)) => {
                 log(&format!("exported session text ({} bytes) to Wayland", text.len()));
+                self.text = text.clone();
                 wl_copy(&[], text);
             }
             Some(SessionExport::Png(png)) => {
@@ -1267,31 +1286,15 @@ impl Bridge {
         {
             return;
         }
-        // Text needs no bridge: KWin pushes the Wayland selection onto X11
-        // whenever wfica gains focus. Drop any cached DIB so focus changes do
-        // not push a stale image over it.
+        // Releasing CLIPBOARD (unfocus, or the c2h poke) makes KWin fire
+        // clipboard-changed with the previous text and no image. That is not
+        // a new copy. Dropping the DIB here is what made mstsc paste fail:
+        // wfica's delayed render (WFCLIP_RENDER_REPLY) found nothing to send.
+        if file.is_none() && self.host_offer && !self.dib.is_empty() && self.image_echo_window() {
+            return;
+        }
         let Some(png) = file.or_else(fetch_wayland_image) else {
-            // Not an image: mirror the text so a paste into Citrix still finds
-            // a payload while we own CLIPBOARD, and stop offering the DIB.
-            let text = fetch_wayland_text();
-            self.text = text.unwrap_or_default();
-            if !self.text.is_empty() {
-                log(&format!("cached Wayland text ({} bytes)", self.text.len()));
-            }
-            if self.host_offer {
-                log("Wayland clipboard has no image; dropped cached DIB");
-                self.host_offer = false;
-                self.pending_serve = false;
-                self.reassert_left = 0;
-                self.ingest_seq += 1;
-                self.dib.clear();
-                self.png.clear();
-                self.last_hash = 0;
-            }
-            if self.text.is_empty() && self.dib.is_empty() && self.we_own(self.atoms.clipboard) {
-                self.release_selections();
-                log("released CLIPBOARD (nothing left to serve)");
-            }
+            self.on_clipboard_without_image();
             return;
         };
         // Keep the previous text on purpose: while we own CLIPBOARD, wfica asks
@@ -1361,6 +1364,58 @@ impl Bridge {
         self.session_pull_done = true;
         // claim_for_citrix sets pending_serve / ingest_seq / host_offer.
         self.claim_for_citrix("ingest");
+    }
+
+    /// True while a missing image is still the echo of our own CLIPBOARD
+    /// release or of the screenshot ingest burst, not a user copy.
+    fn image_echo_window(&self) -> bool {
+        self.last_ingest_at
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(400))
+            || self.released_at
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(800))
+    }
+
+    fn on_clipboard_without_image(&mut self) {
+        let text = fetch_wayland_text().unwrap_or_default();
+        if self.host_offer && !self.dib.is_empty() {
+            let replaced = image_replaced_by_text(
+                if text.is_empty() { None } else { Some(text.as_slice()) },
+                &self.text,
+                self.last_ingest_at.map(|t| t.elapsed()),
+                self.released_at.map(|t| t.elapsed()),
+            );
+            if replaced {
+                self.remember_text(text);
+                log("Wayland text replaced the image; dropped cached DIB");
+                self.host_offer = false;
+                self.pending_serve = false;
+                self.serve_seen = false;
+                self.reassert_left = 0;
+                self.ingest_seq += 1;
+                self.dib.clear();
+                self.png.clear();
+                self.last_hash = 0;
+            }
+            // Same text, or an empty echo of our own CLIPBOARD release: keep
+            // the DIB. mstsc paste renders it later. Clearing `text` here is
+            // what wedged VDCLIP into its BadAtom loop.
+            return;
+        }
+        self.remember_text(text);
+        if self.text.is_empty() && self.dib.is_empty() && self.we_own(self.atoms.clipboard) {
+            self.release_selections();
+            log("released CLIPBOARD (nothing left to serve)");
+        }
+    }
+
+    fn remember_text(&mut self, text: Vec<u8>) {
+        if text == self.text {
+            return;
+        }
+        self.text = text;
+        if !self.text.is_empty() {
+            log(&format!("cached Wayland text ({} bytes)", self.text.len()));
+        }
     }
 
     // ---- events / timers ------------------------------------------------
@@ -1580,6 +1635,28 @@ fn notify_daemon() {
         }
         libc::write(fd, b"x".as_ptr().cast(), 1);
         libc::close(fd);
+    }
+}
+
+/// Drop a cached screenshot only when Wayland gained different text outside
+/// the window where our own CLIPBOARD release echoes the previous selection.
+/// mstsc paste re-reads the image later (Citrix delayed render); an echo
+/// must not clear it first.
+fn image_replaced_by_text(
+    wayland_text: Option<&[u8]>,
+    text_before: &[u8],
+    since_ingest: Option<Duration>,
+    since_release: Option<Duration>,
+) -> bool {
+    if since_ingest.is_some_and(|d| d < Duration::from_millis(400)) {
+        return false;
+    }
+    if since_release.is_some_and(|d| d < Duration::from_millis(800)) {
+        return false;
+    }
+    match wayland_text {
+        Some(text) if !text.is_empty() && text != text_before => true,
+        _ => false,
     }
 }
 
@@ -1936,6 +2013,8 @@ fn daemon_mode(foreground: bool) -> i32 {
         last_export_at: None,
         pull_cool_until: None,
         host_offer: false,
+        released_at: None,
+        serve_seen: false,
         last_clip_owner: 0,
         wfica_took_at: None,
         last_x_time: 0,
@@ -1976,4 +2055,42 @@ fn main() -> std::process::ExitCode {
     }
     let foreground = args.iter().skip(1).any(|a| a == "--foreground");
     std::process::ExitCode::from(daemon_mode(foreground) as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn echo_after_release_keeps_image() {
+        let old = b"previous selection";
+        assert!(!image_replaced_by_text(
+            Some(old),
+            old,
+            Some(Duration::from_secs(30)),
+            Some(Duration::from_millis(50)),
+        ));
+        assert!(!image_replaced_by_text(
+            None,
+            old,
+            Some(Duration::from_millis(100)),
+            None,
+        ));
+    }
+
+    #[test]
+    fn new_text_replaces_image() {
+        assert!(image_replaced_by_text(
+            Some(b"fresh copy"),
+            b"previous selection",
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(5)),
+        ));
+        assert!(!image_replaced_by_text(
+            Some(b"previous selection"),
+            b"previous selection",
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(5)),
+        ));
+    }
 }
