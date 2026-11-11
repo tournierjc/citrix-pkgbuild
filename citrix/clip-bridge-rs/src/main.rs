@@ -239,6 +239,10 @@ struct Bridge {
     host_offer: bool,
     /// Set when we SetSelectionOwner(None) on CLIPBOARD we owned.
     released_at: Option<Instant>,
+    /// When wfica last lost focus. An image offer stays owned across that
+    /// gap: mstsc paste is a delayed WFCLIP render and often lands after a
+    /// focus flap.
+    unfocused_at: Option<Instant>,
     /// wfica has sent SelectionRequest for this offer. Releasing CLIPBOARD
     /// after that races the C2H render (mstsc paste → WFCLIP_RENDER_REPLY).
     serve_seen: bool,
@@ -433,14 +437,23 @@ impl Bridge {
         }
     }
 
-    fn offer_selections(&mut self) {
-        // Only while the Citrix window is focused. Holding CLIPBOARD the rest
-        // of the time makes KWin sync our stale/empty payload back onto the
-        // Wayland clipboard and breaks paste between Linux apps.
-        if !self.session_active || !self.wfica_focused {
-            return;
+    /// Image still needs to be readable by wfica, including for a short time
+    /// after focus leaves, so mstsc's delayed render can fetch it.
+    fn keep_image_owner(&self) -> bool {
+        if !self.session_active || !self.host_offer || self.dib.is_empty() {
+            return false;
         }
-        if !self.host_offer || self.dib.is_empty() {
+        self.wfica_focused
+            || self
+                .unfocused_at
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(45))
+    }
+
+    fn offer_selections(&mut self) {
+        // Owning CLIPBOARD while Citrix is unfocused makes KWin mirror our
+        // selection back onto Wayland. keep_image_owner() is the exception:
+        // mstsc still has to read the DIB after a focus flap.
+        if !self.keep_image_owner() {
             return;
         }
         let t = if self.last_x_time != 0 { self.last_x_time } else { CURRENT_TIME };
@@ -477,10 +490,12 @@ impl Bridge {
         self.host_offer = true;
         self.pending_serve = true;
         self.serve_seen = false;
+        // A leftover session export would be pushed to Wayland on unfocus
+        // and look like a new text copy that replaces this image.
+        self.session_export = None;
         if !self.wfica_focused {
             self.reassert_left = 0;
             self.ingest_seq += 1;
-            self.release_selections();
             log(&format!(
                 "cached DIB {}x{} ({} bytes); left host clipboard alone ({reason})",
                 self.img_w,
@@ -491,12 +506,17 @@ impl Bridge {
         }
         self.ingest_seq += 1;
         let seq = self.ingest_seq;
-        self.reassert_left = 6;
-        self.release_selections();
-        self.schedule(Duration::from_millis(40), seq, TimerKind::Reclaim);
-        for (ms, why) in [(200, "200ms"), (500, "500ms"), (1200, "1200ms")] {
-            self.schedule(Duration::from_millis(ms), seq, TimerKind::Poke(why));
+        self.reassert_left = 4;
+        // Take ownership in this turn. Releasing and reclaiming 40ms later
+        // left CLIPBOARD unowned while wfica issued WFCLIP_RENDER_REPLY.
+        // Focus returning to an offer we already hold must not toggle it.
+        if reason == "ingest" && self.we_own(self.atoms.clipboard) {
+            self.release_selections();
         }
+        if !self.we_own(self.atoms.clipboard) {
+            self.offer_selections();
+        }
+        self.schedule(Duration::from_millis(800), seq, TimerKind::Poke("800ms"));
         log(&format!(
             "offered DIB {}x{} ({} bytes) ({reason})",
             self.img_w,
@@ -522,6 +542,9 @@ impl Bridge {
     /// Keep offering our cached host payload while an offer is active.
     fn ensure_clipboard_offer(&mut self) {
         if !self.wfica_focused {
+            if self.keep_image_owner() {
+                return;
+            }
             if self.we_own(self.atoms.clipboard) {
                 self.reassert_left = 0;
                 self.release_selections();
@@ -566,14 +589,18 @@ impl Bridge {
         {
             return;
         }
+        if self.we_own(self.atoms.clipboard) {
+            return;
+        }
         log(&format!("c2h poke ({reason})"));
-        self.release_selections();
-        self.reassert_left = self.reassert_left.max(4);
-        self.schedule(Duration::from_millis(40), self.ingest_seq, TimerKind::Reclaim);
+        self.offer_selections();
     }
 
     fn on_reassert(&mut self) {
         if !self.wfica_focused {
+            if self.keep_image_owner() {
+                return;
+            }
             if self.we_own(self.atoms.clipboard) {
                 self.reassert_left = 0;
                 self.release_selections();
@@ -633,17 +660,27 @@ impl Bridge {
         }
         let focused = self.wfica_is_focused();
         if focused == self.wfica_focused {
+            if !focused && self.we_own(self.atoms.clipboard) && !self.keep_image_owner() {
+                self.release_selections();
+                log("released CLIPBOARD (image offer expired)");
+            }
             return;
         }
         self.wfica_focused = focused;
         log(if focused { "wfica focused" } else { "wfica unfocused" });
         if !focused {
+            self.unfocused_at = Some(Instant::now());
             self.reassert_left = 0;
+            if self.keep_image_owner() {
+                log("keeping CLIPBOARD image offer after unfocus");
+                return;
+            }
             self.release_selections();
             log("released CLIPBOARD (wfica unfocused)");
             self.publish_session_export();
             return;
         }
+        self.unfocused_at = None;
         if self.host_offer && !self.dib.is_empty() {
             self.claim_for_citrix("focus");
         }
@@ -799,9 +836,10 @@ impl Bridge {
         // here is what wedges VDCLIP for the whole session (BadAtom loop), so
         // every text target is answered, even with an empty payload.
         if t == a.utf8_string || t == a.text_plain_utf8 || t == a.text_plain || t == a.text {
-            let n = self.text.len();
+            let payload = self.text.clone();
+            let n = payload.len();
             let name = self.target_name(t);
-            if self.answer(&ev, prop, t, &self.text, 8) {
+            if self.answer(&ev, prop, t, &payload, 8) {
                 log(&format!("served {name} {n} bytes"));
             }
             return;
@@ -810,6 +848,8 @@ impl Bridge {
             {
                 // STRING/COMPOUND_TEXT are pre-UTF-8: latin-1 keeps ASCII exact
                 // and never emits invalid UTF-8, which wfica treats as garbage.
+                // An empty answer wedges VDCLIP just like a refusal, so the
+                // last real text is served even while an image is offered.
                 let payload = to_latin1(&self.text);
                 let n = payload.len();
                 let name = self.target_name(t);
@@ -2014,6 +2054,7 @@ fn daemon_mode(foreground: bool) -> i32 {
         pull_cool_until: None,
         host_offer: false,
         released_at: None,
+        unfocused_at: None,
         serve_seen: false,
         last_clip_owner: 0,
         wfica_took_at: None,
