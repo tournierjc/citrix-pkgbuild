@@ -239,6 +239,10 @@ struct Bridge {
     /// _ISL_DIB was served at least once for this cache. On the next unfocus
     /// we drop it so a later focus cannot re-push the same image into VDCLIP.
     image_delivered: bool,
+    /// After a delivered drop, ignore the same Wayland png briefly so KWin's
+    /// clipboard echo cannot restart the offer loop. Once this passes, the
+    /// same image may be adopted again (e.g. focus returns, user pastes later).
+    echo_suppress_until: Option<Instant>,
     /// Set when we SetSelectionOwner(None) on CLIPBOARD we owned.
     released_at: Option<Instant>,
     /// wfica has sent SelectionRequest for this offer. Releasing CLIPBOARD
@@ -479,10 +483,10 @@ impl Bridge {
         self.png.clear();
         self.img_w = 0;
         self.img_h = 0;
-        // Keep last_hash. Clearing it made every unfocus re-ingest the same
-        // Wayland png (still on the clipboard) and re-offer it on the next
-        // focus — the VDCLIP push loop. A genuine new copy has a new hash;
-        // identical re-copy is ignored until the selection changes.
+        // Keep last_hash for a short echo window only. Immediate re-ingest of
+        // the same Wayland png is the offer loop; blocking it forever made a
+        // second paste of the same screenshot impossible.
+        self.echo_suppress_until = Some(Instant::now() + Duration::from_secs(2));
         self.release_selections();
     }
 
@@ -712,6 +716,11 @@ impl Bridge {
         }
         if self.host_offer && !self.dib.is_empty() {
             self.claim_for_citrix("focus");
+        } else {
+            // Copy happened while we were unfocused and the cache was empty
+            // (or was dropped after a prior deliver). Pick up a pure image
+            // from Wayland now so paste in MSTSC still works.
+            self.adopt_wayland_image("focus");
         }
     }
 
@@ -820,7 +829,11 @@ impl Bridge {
             // while bridging to Citrix: advertising it makes XWayland
             // ConvertSelection then steal CLIPBOARD ownership.
             let mut list = vec![a.targets, a.timestamp];
-            if !self.dib.is_empty() {
+            let image_offer = self.host_offer && !self.dib.is_empty();
+            if image_offer {
+                // Image-only TARGETS. Listing stale text here made wfica
+                // register CF_TEXT alongside CF_DIB, and MSTSC pasted the old
+                // string instead of the screenshot.
                 list.extend_from_slice(&[
                     a.isl_dib,
                     a.dib,
@@ -829,10 +842,7 @@ impl Bridge {
                     a.image_bmp,
                     a.bmp,
                 ]);
-            }
-            if !self.text.is_empty() {
-                // Owning CLIPBOARD must never hide text from wfica: offer the
-                // last Wayland text next to the image instead of refusing it.
+            } else if !self.text.is_empty() {
                 list.extend_from_slice(&[
                     a.utf8_string,
                     a.compound_text,
@@ -860,15 +870,14 @@ impl Bridge {
             self.answer(&ev, prop, AtomEnum::INTEGER.into(), &ts.to_le_bytes(), 32);
             return;
         }
-        // Text goes straight through: while we own CLIPBOARD, wfica's Ctrl+V
-        // converts UTF8_STRING/STRING and used to get property=None. A refusal
-        // here is what wedges VDCLIP for the whole session (BadAtom loop), so
-        // every text target is answered, even with an empty payload.
+        // Always answer text targets (refusal → BadAtom wedge). During an
+        // image offer the payload is empty so MSTSC does not paste stale text
+        // instead of the bitmap; TARGETS also omits text in that case.
         if t == a.utf8_string || t == a.text_plain_utf8 || t == a.text_plain || t == a.text {
-            let payload = self.text.clone();
+            let payload = self.text_for_offer();
             let n = payload.len();
             let name = self.target_name(t);
-            if self.answer(&ev, prop, t, &payload, 8) {
+            if self.answer(&ev, prop, t, payload, 8) {
                 log(&format!("served {name} {n} bytes"));
             }
             return;
@@ -877,9 +886,7 @@ impl Bridge {
             {
                 // STRING/COMPOUND_TEXT are pre-UTF-8: latin-1 keeps ASCII exact
                 // and never emits invalid UTF-8, which wfica treats as garbage.
-                // An empty answer wedges VDCLIP just like a refusal, so the
-                // last real text is served even while an image is offered.
-                let payload = to_latin1(&self.text);
+                let payload = to_latin1(self.text_for_offer());
                 let n = payload.len();
                 let name = self.target_name(t);
                 if self.answer(&ev, prop, t, &payload, 8) {
@@ -1390,8 +1397,9 @@ impl Bridge {
         // paste into Citrix still works. wl-paste --watch only fires on a
         // *new* Wayland selection, so a silent return here also hides
         // "user re-copied the same screenshot" when ownership was lost.
-        // Same bytes as the current undelivered cache: nothing new to do.
-        // (A re-copy after we dropped clears last_hash, so that still works.)
+        // Same bytes as an undelivered cache: reclaim if ownership was lost.
+        // After a delivered drop, last_hash is kept only for a short echo
+        // window — once that expires the same screenshot can be offered again.
         if hash == self.last_hash {
             if self.host_offer
                 && !self.dib.is_empty()
@@ -1400,8 +1408,12 @@ impl Bridge {
                 && !self.image_delivered
             {
                 self.claim_for_citrix("reingest");
+                return;
             }
-            return;
+            if self.host_offer || self.echo_suppress_active() {
+                return;
+            }
+            // Fall through and rebuild the DIB from the same png.
         }
         if self
             .last_export_at
@@ -1440,12 +1452,75 @@ impl Bridge {
         self.img_w = w;
         self.img_h = h;
         self.last_hash = hash;
+        self.echo_suppress_until = None;
         self.last_ingest_at = Some(Instant::now());
         self.pull_cool_until = Some(Instant::now() + Duration::from_secs(2));
         self.pulled_owner_xid = 0;
         // Prefer host offer over session pull until a real session image arrives.
         self.session_pull_done = true;
         // claim_for_citrix sets pending_serve / ingest_seq / host_offer.
+        self.claim_for_citrix("ingest");
+    }
+
+    fn echo_suppress_active(&self) -> bool {
+        self.echo_suppress_until
+            .is_some_and(|t| Instant::now() < t)
+    }
+
+    /// Text payload while we own CLIPBOARD. Empty during an image offer so
+    /// MSTSC cannot prefer a stale CF_TEXT over the bitmap.
+    fn text_for_offer(&self) -> &[u8] {
+        if self.host_offer && !self.dib.is_empty() {
+            &[]
+        } else {
+            &self.text
+        }
+    }
+
+    /// Pull a pure Wayland image into the host offer (no text MIME). Used on
+    /// focus when the cache was dropped after a prior deliver, and as a
+    /// fallback when wl-paste --watch already fired while unfocused.
+    fn adopt_wayland_image(&mut self, reason: &str) {
+        if self.host_offer && !self.dib.is_empty() {
+            return;
+        }
+        if wayland_types().iter().any(|t| is_text_type(t)) {
+            return;
+        }
+        let Some(png) = fetch_wayland_image() else {
+            return;
+        };
+        let hash = hash_bytes(&png);
+        if hash == self.last_hash && self.echo_suppress_active() {
+            return;
+        }
+        if !self.wfica_running() {
+            return;
+        }
+        self.set_session_active(true, reason);
+        let Some((rgb, w, h)) = dib::decode_image(&png) else {
+            return;
+        };
+        let (orig_w, orig_h) = (w, h);
+        let (rgb, w, h) = match dib::downscale_to_fit(&rgb, w, h, self.max_prop) {
+            (r, nw, nh) if (nw, nh) != (w, h) => (r, nw, nh),
+            same => same,
+        };
+        self.dib = dib::rgb_to_isl_dib(&rgb, w, h);
+        self.png = if (w, h) != (orig_w, orig_h) || png.len() > self.max_prop {
+            dib::png_encode(&rgb, w, h).unwrap_or(png)
+        } else {
+            png
+        };
+        self.img_w = w;
+        self.img_h = h;
+        self.last_hash = hash;
+        self.echo_suppress_until = None;
+        self.last_ingest_at = Some(Instant::now());
+        self.pull_cool_until = Some(Instant::now() + Duration::from_secs(2));
+        self.pulled_owner_xid = 0;
+        self.session_pull_done = true;
+        log(&format!("adopted Wayland image {w}x{h} ({reason})"));
         self.claim_for_citrix("ingest");
     }
 
@@ -2113,6 +2188,7 @@ fn daemon_mode(foreground: bool) -> i32 {
         pull_cool_until: None,
         host_offer: false,
         image_delivered: false,
+        echo_suppress_until: None,
         released_at: None,
         serve_seen: false,
         last_clip_owner: 0,
