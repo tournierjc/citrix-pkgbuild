@@ -239,10 +239,6 @@ struct Bridge {
     host_offer: bool,
     /// Set when we SetSelectionOwner(None) on CLIPBOARD we owned.
     released_at: Option<Instant>,
-    /// When wfica last lost focus. An image offer stays owned across that
-    /// gap: mstsc paste is a delayed WFCLIP render and often lands after a
-    /// focus flap.
-    unfocused_at: Option<Instant>,
     /// wfica has sent SelectionRequest for this offer. Releasing CLIPBOARD
     /// after that races the C2H render (mstsc paste → WFCLIP_RENDER_REPLY).
     serve_seen: bool,
@@ -437,23 +433,15 @@ impl Bridge {
         }
     }
 
-    /// Image still needs to be readable by wfica, including for a short time
-    /// after focus leaves, so mstsc's delayed render can fetch it.
-    fn keep_image_owner(&self) -> bool {
-        if !self.session_active || !self.host_offer || self.dib.is_empty() {
-            return false;
-        }
-        self.wfica_focused
-            || self
-                .unfocused_at
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(45))
-    }
-
     fn offer_selections(&mut self) {
-        // Owning CLIPBOARD while Citrix is unfocused makes KWin mirror our
-        // selection back onto Wayland. keep_image_owner() is the exception:
-        // mstsc still has to read the DIB after a focus flap.
-        if !self.keep_image_owner() {
+        // Only while the Citrix window is focused. Holding CLIPBOARD after
+        // unfocus made KWin mirror our DIB onto Wayland and, on the next
+        // focus, re-pushed an 8 MB leftover image into the session (VDCLIP
+        // BadAtom loop, multi-core wfica).
+        if !self.session_active || !self.wfica_focused {
+            return;
+        }
+        if !self.host_offer || self.dib.is_empty() {
             return;
         }
         let t = if self.last_x_time != 0 { self.last_x_time } else { CURRENT_TIME };
@@ -470,7 +458,15 @@ impl Bridge {
         }
     }
 
-    fn drop_clipboard_ownership(&mut self) {
+    /// Forget a host image so a later focus / reconnect cannot re-offer it.
+    fn drop_image_offer(&mut self, reason: &str) {
+        if !self.host_offer && self.dib.is_empty() {
+            return;
+        }
+        log(&format!(
+            "dropped image offer {}x{} ({reason})",
+            self.img_w, self.img_h
+        ));
         self.reassert_left = 0;
         self.pending_serve = false;
         self.serve_seen = false;
@@ -480,6 +476,13 @@ impl Bridge {
         self.png.clear();
         self.img_w = 0;
         self.img_h = 0;
+        // Keep last_hash so a lingering Wayland png is not re-ingested as a
+        // "new" screenshot after we deliberately dropped the offer.
+        self.release_selections();
+    }
+
+    fn drop_clipboard_ownership(&mut self) {
+        self.drop_image_offer("session end");
         self.release_selections();
     }
 
@@ -509,7 +512,6 @@ impl Bridge {
         self.reassert_left = 4;
         // Take ownership in this turn. Releasing and reclaiming 40ms later
         // left CLIPBOARD unowned while wfica issued WFCLIP_RENDER_REPLY.
-        // Focus returning to an offer we already hold must not toggle it.
         if reason == "ingest" && self.we_own(self.atoms.clipboard) {
             self.release_selections();
         }
@@ -542,9 +544,6 @@ impl Bridge {
     /// Keep offering our cached host payload while an offer is active.
     fn ensure_clipboard_offer(&mut self) {
         if !self.wfica_focused {
-            if self.keep_image_owner() {
-                return;
-            }
             if self.we_own(self.atoms.clipboard) {
                 self.reassert_left = 0;
                 self.release_selections();
@@ -598,9 +597,6 @@ impl Bridge {
 
     fn on_reassert(&mut self) {
         if !self.wfica_focused {
-            if self.keep_image_owner() {
-                return;
-            }
             if self.we_own(self.atoms.clipboard) {
                 self.reassert_left = 0;
                 self.release_selections();
@@ -660,30 +656,26 @@ impl Bridge {
         }
         let focused = self.wfica_is_focused();
         if focused == self.wfica_focused {
-            if !focused && self.we_own(self.atoms.clipboard) && !self.keep_image_owner() {
-                self.release_selections();
-                log("released CLIPBOARD (image offer expired)");
-            }
             return;
         }
         self.wfica_focused = focused;
         log(if focused { "wfica focused" } else { "wfica unfocused" });
         if !focused {
-            self.unfocused_at = Some(Instant::now());
             self.reassert_left = 0;
-            if self.keep_image_owner() {
-                log("keeping CLIPBOARD image offer after unfocus");
-                return;
+            // Drop the image with the focus. Re-offering the same DIB on the
+            // next focus (or after a reconnect) is what jammed VDCLIP and
+            // pegged wfica at several cores.
+            if self.host_offer {
+                self.drop_image_offer("unfocus");
+            } else {
+                self.release_selections();
+                log("released CLIPBOARD (wfica unfocused)");
             }
-            self.release_selections();
-            log("released CLIPBOARD (wfica unfocused)");
             self.publish_session_export();
             return;
         }
-        self.unfocused_at = None;
-        if self.host_offer && !self.dib.is_empty() {
-            self.claim_for_citrix("focus");
-        }
+        // Focus alone never re-offers a cached image. A fresh Wayland copy
+        // while focused is the only path that claims CLIPBOARD for a DIB.
     }
 
     // ---- serving (Wayland -> Citrix) ----------------------------------
@@ -976,10 +968,9 @@ impl Bridge {
     /// wfica set the X11 owner: a copy inside the session. Read it straight
     /// from wfica, then empty the Wayland clipboard (see `session_export`).
     fn on_session_copy(&mut self, owner: Window) {
-        self.host_offer = false;
-        self.pending_serve = false;
-        self.reassert_left = 0;
-        self.ingest_seq += 1;
+        // A host image left in `dib` would be re-offered on the next focus
+        // and overwrite this session copy.
+        self.drop_image_offer("session copy");
         self.session_export = None;
         self.session_pull_done = false;
         self.pulled_owner_xid = 0;
@@ -1333,6 +1324,13 @@ impl Bridge {
         if file.is_none() && self.host_offer && !self.dib.is_empty() && self.image_echo_window() {
             return;
         }
+        // A copy that also carries plain text (browser, IDE, office) is a text
+        // copy with a rendered preview. Pushing its image into Citrix replaced
+        // the session clipboard with a picture nobody asked for.
+        if wayland_types().iter().any(|t| is_text_type(t)) {
+            self.on_clipboard_without_image();
+            return;
+        }
         let Some(png) = file.or_else(fetch_wayland_image) else {
             self.on_clipboard_without_image();
             return;
@@ -1353,11 +1351,10 @@ impl Bridge {
         // paste into Citrix still works. wl-paste --watch only fires on a
         // *new* Wayland selection, so a silent return here also hides
         // "user re-copied the same screenshot" when ownership was lost.
+        // Same bytes as an offer we already built (or deliberately dropped).
+        // Do not reclaim: that is how a leftover screenshot re-entered Citrix
+        // after unfocus / reconnect and wedged VDCLIP.
         if hash == self.last_hash {
-            if self.host_offer && !self.dib.is_empty() && !self.we_own(self.atoms.clipboard) {
-                log("reingest same png; CLIPBOARD not owned, re-claiming");
-                self.claim_for_citrix("reingest");
-            }
             return;
         }
         if self
@@ -1426,19 +1423,11 @@ impl Bridge {
             );
             if replaced {
                 self.remember_text(text);
-                log("Wayland text replaced the image; dropped cached DIB");
-                self.host_offer = false;
-                self.pending_serve = false;
-                self.serve_seen = false;
-                self.reassert_left = 0;
-                self.ingest_seq += 1;
-                self.dib.clear();
-                self.png.clear();
                 self.last_hash = 0;
+                self.drop_image_offer("wayland text");
             }
             // Same text, or an empty echo of our own CLIPBOARD release: keep
-            // the DIB. mstsc paste renders it later. Clearing `text` here is
-            // what wedged VDCLIP into its BadAtom loop.
+            // the DIB while still focused so a paste into Citrix can finish.
             return;
         }
         self.remember_text(text);
@@ -1698,6 +1687,31 @@ fn image_replaced_by_text(
         Some(text) if !text.is_empty() && text != text_before => true,
         _ => false,
     }
+}
+
+fn wayland_types() -> Vec<String> {
+    let Ok(out) = Command::new("timeout")
+        .args(["1", "wl-paste", "--list-types"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_owned())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+fn is_text_type(mime: &str) -> bool {
+    mime == "text/plain"
+        || mime.starts_with("text/plain;")
+        || mime == "UTF8_STRING"
+        || mime == "STRING"
+        || mime == "TEXT"
 }
 
 /// Probe Wayland for any image MIME Citrix might need. Used when the
@@ -2054,7 +2068,6 @@ fn daemon_mode(foreground: bool) -> i32 {
         pull_cool_until: None,
         host_offer: false,
         released_at: None,
-        unfocused_at: None,
         serve_seen: false,
         last_clip_owner: 0,
         wfica_took_at: None,
@@ -2117,6 +2130,15 @@ mod tests {
             Some(Duration::from_millis(100)),
             None,
         ));
+    }
+
+    #[test]
+    fn text_types_mark_a_text_copy() {
+        assert!(is_text_type("text/plain"));
+        assert!(is_text_type("text/plain;charset=utf-8"));
+        assert!(is_text_type("UTF8_STRING"));
+        assert!(!is_text_type("text/html"));
+        assert!(!is_text_type("image/png"));
     }
 
     #[test]
