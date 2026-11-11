@@ -479,9 +479,10 @@ impl Bridge {
         self.png.clear();
         self.img_w = 0;
         self.img_h = 0;
-        // Clear hash so the user can re-copy the same screenshot later.
-        // Echo suppression uses released_at / image_echo_window instead.
-        self.last_hash = 0;
+        // Keep last_hash. Clearing it made every unfocus re-ingest the same
+        // Wayland png (still on the clipboard) and re-offer it on the next
+        // focus — the VDCLIP push loop. A genuine new copy has a new hash;
+        // identical re-copy is ignored until the selection changes.
         self.release_selections();
     }
 
