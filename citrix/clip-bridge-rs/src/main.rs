@@ -233,10 +233,12 @@ struct Bridge {
     last_ingest_at: Option<Instant>,
     last_export_at: Option<Instant>,
     pull_cool_until: Option<Instant>,
-    /// True after a Wayland image ingest until we successfully export a
-    /// session image. While set, ignore empty wfica CLIPBOARD grabs (paste
-    /// into Citrix) and keep re-offering our DIB instead of pull-storming.
+    /// Cached Linux image waiting for Citrix. Survives unfocus (CLIPBOARD is
+    /// released, the bytes stay) so copy-on-Linux / paste-in-MSTSC works.
     host_offer: bool,
+    /// _ISL_DIB was served at least once for this cache. On the next unfocus
+    /// we drop it so a later focus cannot re-push the same image into VDCLIP.
+    image_delivered: bool,
     /// Set when we SetSelectionOwner(None) on CLIPBOARD we owned.
     released_at: Option<Instant>,
     /// wfica has sent SelectionRequest for this offer. Releasing CLIPBOARD
@@ -471,13 +473,15 @@ impl Bridge {
         self.pending_serve = false;
         self.serve_seen = false;
         self.host_offer = false;
+        self.image_delivered = false;
         self.ingest_seq += 1;
         self.dib.clear();
         self.png.clear();
         self.img_w = 0;
         self.img_h = 0;
-        // Keep last_hash so a lingering Wayland png is not re-ingested as a
-        // "new" screenshot after we deliberately dropped the offer.
+        // Clear hash so the user can re-copy the same screenshot later.
+        // Echo suppression uses released_at / image_echo_window instead.
+        self.last_hash = 0;
         self.release_selections();
     }
 
@@ -491,8 +495,16 @@ impl Bridge {
             return;
         }
         self.host_offer = true;
-        self.pending_serve = true;
-        self.serve_seen = false;
+        // Fresh ingest: not yet delivered. Focus reclaim of an undelivered
+        // cache keeps image_delivered as-is (false until _ISL_DIB is served).
+        if reason == "ingest" {
+            self.image_delivered = false;
+            self.pending_serve = true;
+            self.serve_seen = false;
+        } else if !self.image_delivered {
+            self.pending_serve = true;
+            self.serve_seen = false;
+        }
         // A leftover session export would be pushed to Wayland on unfocus
         // and look like a new text copy that replaces this image.
         self.session_export = None;
@@ -507,6 +519,11 @@ impl Bridge {
             ));
             return;
         }
+        // Already delivered and still focused: keep ownership if we have it,
+        // but do not bounce the selection (that re-triggers VDCLIP).
+        if self.image_delivered && self.we_own(self.atoms.clipboard) {
+            return;
+        }
         self.ingest_seq += 1;
         let seq = self.ingest_seq;
         self.reassert_left = 4;
@@ -518,7 +535,9 @@ impl Bridge {
         if !self.we_own(self.atoms.clipboard) {
             self.offer_selections();
         }
-        self.schedule(Duration::from_millis(800), seq, TimerKind::Poke("800ms"));
+        if !self.image_delivered {
+            self.schedule(Duration::from_millis(800), seq, TimerKind::Poke("800ms"));
+        }
         log(&format!(
             "offered DIB {}x{} ({} bytes) ({reason})",
             self.img_w,
@@ -656,26 +675,43 @@ impl Bridge {
         }
         let focused = self.wfica_is_focused();
         if focused == self.wfica_focused {
+            // Undelivered cache older than 2 minutes: drop so a reconnect
+            // cannot push a stale screenshot hours later.
+            if !focused
+                && self.host_offer
+                && !self.image_delivered
+                && self
+                    .last_ingest_at
+                    .is_some_and(|t| t.elapsed() > Duration::from_secs(120))
+            {
+                self.drop_image_offer("stale cache");
+            }
             return;
         }
         self.wfica_focused = focused;
         log(if focused { "wfica focused" } else { "wfica unfocused" });
         if !focused {
             self.reassert_left = 0;
-            // Drop the image with the focus. Re-offering the same DIB on the
-            // next focus (or after a reconnect) is what jammed VDCLIP and
-            // pegged wfica at several cores.
-            if self.host_offer {
-                self.drop_image_offer("unfocus");
-            } else {
-                self.release_selections();
-                log("released CLIPBOARD (wfica unfocused)");
+            // Release ownership so KWin does not mirror our DIB onto Wayland,
+            // but keep an undelivered cache for the next focus (copy on Linux,
+            // paste in MSTSC). After Citrix has fetched _ISL_DIB once, drop
+            // so we never re-push the same image on every focus flap.
+            self.release_selections();
+            log("released CLIPBOARD (wfica unfocused)");
+            if self.host_offer && self.image_delivered {
+                self.drop_image_offer("delivered");
+            } else if self.host_offer {
+                log(&format!(
+                    "kept cached DIB {}x{} for next focus",
+                    self.img_w, self.img_h
+                ));
             }
             self.publish_session_export();
             return;
         }
-        // Focus alone never re-offers a cached image. A fresh Wayland copy
-        // while focused is the only path that claims CLIPBOARD for a DIB.
+        if self.host_offer && !self.dib.is_empty() {
+            self.claim_for_citrix("focus");
+        }
     }
 
     // ---- serving (Wayland -> Citrix) ----------------------------------
@@ -870,6 +906,7 @@ impl Bridge {
                 let n = self.dib.len();
                 if self.answer(&ev, prop, t, &self.dib, 8) {
                     self.pending_serve = false;
+                    self.image_delivered = true;
                     log(&format!("served _ISL_DIB {n} bytes"));
                 }
             }
@@ -883,6 +920,7 @@ impl Bridge {
                 let n = payload.len();
                 if self.answer(&ev, prop, t, &payload, 8) {
                     self.pending_serve = false;
+                    self.image_delivered = true;
                     log(&format!("served DIB {n} bytes"));
                 }
             }
@@ -1351,10 +1389,17 @@ impl Bridge {
         // paste into Citrix still works. wl-paste --watch only fires on a
         // *new* Wayland selection, so a silent return here also hides
         // "user re-copied the same screenshot" when ownership was lost.
-        // Same bytes as an offer we already built (or deliberately dropped).
-        // Do not reclaim: that is how a leftover screenshot re-entered Citrix
-        // after unfocus / reconnect and wedged VDCLIP.
+        // Same bytes as the current undelivered cache: nothing new to do.
+        // (A re-copy after we dropped clears last_hash, so that still works.)
         if hash == self.last_hash {
+            if self.host_offer
+                && !self.dib.is_empty()
+                && self.wfica_focused
+                && !self.we_own(self.atoms.clipboard)
+                && !self.image_delivered
+            {
+                self.claim_for_citrix("reingest");
+            }
             return;
         }
         if self
@@ -1423,7 +1468,6 @@ impl Bridge {
             );
             if replaced {
                 self.remember_text(text);
-                self.last_hash = 0;
                 self.drop_image_offer("wayland text");
             }
             // Same text, or an empty echo of our own CLIPBOARD release: keep
@@ -2067,6 +2111,7 @@ fn daemon_mode(foreground: bool) -> i32 {
         last_export_at: None,
         pull_cool_until: None,
         host_offer: false,
+        image_delivered: false,
         released_at: None,
         serve_seen: false,
         last_clip_owner: 0,
